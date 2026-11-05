@@ -322,6 +322,38 @@ async function storeSuite(): Promise<void> {
 		assert.strictEqual(requests.length, 1);
 	});
 
+	await test("改开栏之前就存在的句子（句号在句内）也会送预览", async () => {
+		const { store, requests } = makeStore({ previewDelayMs: 15 });
+		const text = "这是开栏之前就写好的句子。";
+		store.activate("p.md", text, text.length);
+		// 在句子中间改一个字，光标停在句号前面（不在句末）
+		const edited = "这是开栏之前就写坏的句子。";
+		store.onText(edited, edited.length - 1);
+		await flush(70);
+		assert.strictEqual(requests.length, 1);
+		assert.strictEqual(requests[0].text, edited);
+	});
+
+	await test("只是移动光标不发请求", async () => {
+		const { store, requests } = makeStore({ previewDelayMs: 15 });
+		store.activate("q.md", "已经写好的句子。", 8);
+		store.onText("已经写好的句子。", 2);
+		await flush(60);
+		assert.strictEqual(requests.length, 0);
+	});
+
+	await test("整句送过之后，光标停在句号后面原地不动也不再送", async () => {
+		const { store, requests } = makeStore({ previewDelayMs: 15 });
+		store.activate("r.md", "", 0);
+		const text = "今天天气很好。";
+		store.onText(text, text.length);
+		await flush();
+		const before = requests.length;
+		store.onText(text, text.length); // 没有改动
+		await flush(60);
+		assert.strictEqual(requests.length, before);
+	});
+
 	await test("✓ 把条目从列表拿掉并返回改动", async () => {
 		const { store } = makeStore();
 		store.activate("a.md", "", 0);

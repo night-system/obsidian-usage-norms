@@ -62,6 +62,16 @@ export class UsageNormsView extends ItemView {
 		for (let i = 0; i < store.items.length; i += 1) this.renderRow(i);
 	}
 
+	/** 排查用：实际画出来了几行。 */
+	get rowCount(): number {
+		return this.bodyEl ? this.bodyEl.childElementCount : -1;
+	}
+
+	/** 排查用：列表容器的高度（被侧栏收起时会是 0）。 */
+	get bodyHeight(): number {
+		return this.bodyEl ? this.bodyEl.clientHeight : -1;
+	}
+
 	private renderRow(index: number): void {
 		const item = this.plugin.store.items[index];
 		const suggestion = item.suggestion;

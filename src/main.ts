@@ -41,6 +41,7 @@ export default class UsageNormsPlugin extends Plugin {
 	/** 调试日志（只留最近 400 条），命令「导出调试日志」把它写成笔记。 */
 	private logBuffer: string[] = [];
 	private lastStoreLog = "";
+	private lastMetrics = "";
 
 	/** 记一行调试日志（不会自动写盘，只在命令导出时落成一个笔记）。 */
 	log(message: string): void {
@@ -114,6 +115,14 @@ export default class UsageNormsPlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("file-open", () => this.onActiveLeafChange()));
 		// iPad 键盘弹起 / 侧栏收起重建都会走 layout-change：重画面板和正文标记。
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.onLayoutChange()));
+
+		// 键盘弹起改的是视口尺寸：resize 也补一次重画（移动端 layout-change 不一定来）。
+		this.registerDomEvent(window, "resize", () => {
+			this.log(`window-resize ${window.innerWidth}x${window.innerHeight}`);
+			if (!this.panelOpen) return;
+			this.refreshViews();
+			this.scheduleRepaint();
+		});
 
 		// 模板文件被改 / 新增 / 删除 / 改名 → 重读模板；如果改的是当前模板就是换模式。
 		const onVaultChange = (file: { path: string }) => {
@@ -568,9 +577,27 @@ export default class UsageNormsPlugin extends Plugin {
 		for (const view of this.views) {
 			try {
 				view.render();
+				this.logViewMetrics(view);
 			} catch (error) {
+				this.log(`render failed: ${(error as Error).message}`);
 				console.error("[usage-norms] render", error);
 			}
+		}
+	}
+
+	/** 排查用：画了几行、容器多高（侧栏被收起时高度会是 0）。 */
+	private logViewMetrics(view: UsageNormsView): void {
+		const el = view.contentEl;
+		const split = (this.app.workspace as unknown as { leftSplit?: { collapsed?: boolean; width?: number } })
+			.leftSplit;
+		const metrics = `view items=${this.store.items.length} rows=${view.rowCount} bodyH=${
+			view.bodyHeight
+		} elH=${el ? el.clientHeight : -1} elW=${el ? el.clientWidth : -1} splitCollapsed=${
+			split?.collapsed ?? "?"
+		} splitW=${split?.width ?? "?"}`;
+		if (metrics !== this.lastMetrics) {
+			this.lastMetrics = metrics;
+			this.log(metrics);
 		}
 	}
 

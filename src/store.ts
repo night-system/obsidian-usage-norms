@@ -7,7 +7,7 @@ import {
 	fits,
 	requestSuggestions,
 } from "./engine";
-import { openSentence, sentenceJustEnded, splitSentences, spanText } from "./sentences";
+import { openSentence, sentenceJustEnded, sentenceStartAt, splitSentences, spanText } from "./sentences";
 import type { PromptTemplate } from "./templates";
 import type { UsageNormsData } from "./settings";
 
@@ -25,8 +25,6 @@ const RESEND_GUARD_MS = 60_000;
 
 /** 送给模型的「前文语境」最多多少字。 */
 const CONTEXT_CHARS = 800;
-
-const STOP_END = /[。！？!?；;…\u3000]\s*$/;
 
 export interface AssistItem {
 	suggestion: Suggestion;
@@ -71,11 +69,11 @@ function hash(text: string): string {
 /**
  * 侧栏的状态机：按句增量送检、记账、条目列表。
  *
- * 移植自参考实现 `assist_controller.dart`：
- * - **点开面板不整篇扫**：开面板那一刻的正文全部当作「看过了」（基线），只审
- *   之后新写的；整篇要显式点「全文扫描」；
- * - 句号 / 换行一出现 → 立刻送这一句，前文只当 `context`；
- * - 半句停手 900ms → 送一次预览，句号到了整句结果覆盖它；
+ * 送检规则和参考实现 `assist_controller.dart` 对齐：
+ * - **点开面板不整篇扫**：只有「这次改动真正碰到的那一句」才送（靠插入区间判断），
+ *   整篇要显式跑「全文扫描」命令；
+ * - 句号 / 换行落下且这一句被改动过 → 立刻送整句，前文只当 `context`；
+ * - 光标在句子里（包括已有句号的老句子）停手 900ms → 送一次预览；
  * - 记账：每页每种扫描模式记「算过的句子」，同一句不重复花钱；
  * - 一次只发一个请求，后来的排队；被更完整提交覆盖的请求作废。
  */
@@ -91,7 +89,9 @@ export class AssistStore {
 
 	private text = "";
 	private caret = 0;
-	private baseline = new Set<string>();
+	/** 上一次改动插入的范围：用来判断「刚打完这句是不是真的被改过」。 */
+	private insertStart = 0;
+	private insertEnd = 0;
 	private queue: Job[] = [];
 	private running: Job | null = null;
 	private previewTimer: ReturnType<typeof setTimeout> | null = null;
@@ -130,7 +130,8 @@ export class AssistStore {
 		this.fileKey = fileKey;
 		this.text = text;
 		this.caret = caret;
-		this.baseline = new Set(splitSentences(text).map((span) => spanText(text, span)));
+		this.insertStart = text.length;
+		this.insertEnd = text.length;
 		this.host.notify();
 	}
 
@@ -157,7 +158,7 @@ export class AssistStore {
 		this.host.notify();
 	}
 
-	/** 换页（换到另一篇笔记）：旧页的偏移全部作废，新页只当基线。 */
+	/** 换页（换到另一篇笔记）：旧页的偏移全部作废，新页从零开始。 */
 	switchFile(fileKey: string, text: string, caret: number): void {
 		if (!this.active) {
 			this.fileKey = fileKey;
@@ -168,7 +169,8 @@ export class AssistStore {
 		this.fileKey = fileKey;
 		this.text = text;
 		this.caret = caret;
-		this.baseline = new Set(splitSentences(text).map((span) => spanText(text, span)));
+		this.insertStart = text.length;
+		this.insertEnd = text.length;
 		this.host.notify();
 	}
 
@@ -178,7 +180,6 @@ export class AssistStore {
 		this.items = [];
 		this.activeIndex = null;
 		this.error = null;
-		this.baseline.clear();
 		this.scannedAnything = false;
 		this.host.notify();
 		if (this.active && this.text.trim().length > 0 && this.canWork()) this.scanAll();
@@ -190,15 +191,14 @@ export class AssistStore {
 		const pos = Math.max(0, Math.min(caret, text.length));
 		const textChanged = text !== this.text;
 		if (!textChanged) {
-			if (pos !== this.caret) {
-				this.caret = pos;
-				this.schedulePreview();
-			}
+			// 只是移动光标：什么都不送（否则点一下都在烧钱）。
+			this.caret = pos;
 			return;
 		}
 		const oldText = this.text;
 		this.text = text;
 		this.caret = pos;
+		this.trackInsert(oldText, text);
 		this.rebase(oldText, text);
 		if (!this.active) {
 			// 面板不可见时仍在写：偏移已经跟着对齐，建议留着等可见时再判断。
@@ -214,6 +214,24 @@ export class AssistStore {
 		}
 		if (this.canWork()) this.dispatchOnChange();
 		this.host.notify();
+	}
+
+	/** 记下这次改动插入的区间（前后缀对齐后中间那一段）。 */
+	private trackInsert(oldText: string, newText: string): void {
+		let prefix = 0;
+		const maxPrefix = Math.min(oldText.length, newText.length);
+		while (prefix < maxPrefix && oldText.charCodeAt(prefix) === newText.charCodeAt(prefix)) prefix += 1;
+		let suffix = 0;
+		const maxSuffix = Math.min(oldText.length - prefix, newText.length - prefix);
+		while (
+			suffix < maxSuffix &&
+			oldText.charCodeAt(oldText.length - 1 - suffix) ===
+				newText.charCodeAt(newText.length - 1 - suffix)
+		) {
+			suffix += 1;
+		}
+		this.insertStart = prefix;
+		this.insertEnd = newText.length - suffix;
 	}
 
 	/** 手动「全文扫描」：只扫**还没记过的句子**；全扫过就什么都不发。 */
@@ -331,6 +349,8 @@ export class AssistStore {
 		this.error = null;
 		this.text = "";
 		this.caret = 0;
+		this.insertStart = 0;
+		this.insertEnd = 0;
 		this.scannedAnything = false;
 		this.sentFull.clear();
 		this.sentPreview.clear();
@@ -379,24 +399,44 @@ export class AssistStore {
 		if (this.activeIndex !== null && this.activeIndex >= next.length) this.activeIndex = null;
 	}
 
+	/**
+	 * 正文变了之后：刚打完一句就立刻送；否则排一次「半句」的防抖预览。
+	 *
+	 * 和参考实现一致：只有**这次改动真的碰到了这一句**才送整句（避免光标停在
+	 * 句号后面、或者只是粘了个空格就重算）；一次粘贴跨多句时，从插入点所在
+	 * 那一句的句首开始送。
+	 */
 	private dispatchOnChange(): void {
 		this.clearPreviewTimer();
 		const ended = sentenceJustEnded(this.text, this.caret);
-		if (ended) this.sendSpan(ended.start, ended.end, false);
+		if (ended) {
+			const inserted = this.text.slice(this.insertStart, this.insertEnd);
+			const touched = this.insertStart < ended.end && this.insertEnd > ended.start;
+			const newlineTouched = inserted.includes("\n") && ended.end > this.insertStart;
+			if (touched || newlineTouched) {
+				let start = ended.start;
+				if (this.insertStart < this.text.length) {
+					const sentenceStart = sentenceStartAt(this.text, this.insertStart);
+					if (sentenceStart < start) start = sentenceStart;
+				}
+				this.sendSpan(start, ended.end, false);
+			}
+		}
 		this.schedulePreview();
 	}
 
-	/** 半句没写完：停手一会儿送一次预览（不给记账）。 */
+	/**
+	 * 半句没写完：停手一会儿送一次预览（不进「扫过」记录）。
+	 *
+	 * 这里**不**因为句子以句号结尾就跳过：用户在已有一句的中间改字时，光标不在
+	 * 句号后面，句子里带着原来的句号 —— 以前这里跳过，就变成「怎么改都不送」。
+	 */
 	private schedulePreview(): void {
 		this.clearPreviewTimer();
 		if (!this.active || !this.canWork()) return;
 		const span = openSentence(this.text, this.caret);
 		const sentence = spanText(this.text, span);
-		const trimmed = sentence.trim();
-		if (trimmed.length < MIN_TAIL_CHARS) return;
-		// 已经写完整句了：等句号触发，不再送预览。
-		if (STOP_END.test(trimmed)) return;
-		if (this.baseline.has(sentence)) return;
+		if (sentence.trim().length < MIN_TAIL_CHARS) return;
 		if (this.covered(sentence)) return;
 		this.previewTimer = setTimeout(() => {
 			this.previewTimer = null;
@@ -410,12 +450,14 @@ export class AssistStore {
 	/** 这一句是不是已经在算 / 已经算过（免得重复送）。 */
 	private covered(sentence: string): boolean {
 		if (this.recent(this.sentPreview, sentence) || this.recent(this.sentFull, sentence)) return true;
-		for (const item of this.items) {
-			if (item.suggestion.source === sentence) return true;
-		}
+		return this.isScannedSentence(sentence);
+	}
+
+	/** 这一句在当前扫描模式下是不是已经算过（记账）。 */
+	private isScannedSentence(sentence: string): boolean {
 		const record = this.host.data.scans[this.fileKey];
-		if (record && record.mode === this.mode() && record.sentences.includes(sentence)) return true;
-		return false;
+		if (!record || record.mode !== this.mode()) return false;
+		return record.sentences.includes(sentence);
 	}
 
 	private recent(map: Map<string, number>, sentence: string): boolean {
@@ -431,11 +473,12 @@ export class AssistStore {
 	private sendSpan(start: number, end: number, preview: boolean): void {
 		const source = this.text.slice(start, end);
 		if (source.trim().length < (preview ? MIN_TAIL_CHARS : MIN_SENTENCE_CHARS)) return;
-		if (this.baseline.has(source)) return;
 		if (preview) {
 			if (this.recent(this.sentPreview, source) || this.recent(this.sentFull, source)) return;
-		} else if (this.recent(this.sentFull, source)) {
-			return;
+		} else {
+			if (this.recent(this.sentFull, source)) return;
+			// 同模式已经算过的整句不再花钱（改过字就变成另一句，照常送）。
+			if (this.isScannedSentence(source)) return;
 		}
 		// 已经在算的同一段不重复排队。
 		for (const job of [...this.queue, ...(this.running ? [this.running] : [])]) {
