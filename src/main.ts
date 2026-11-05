@@ -303,6 +303,21 @@ export default class UsageNormsPlugin extends Plugin {
 	async scanAll(): Promise<void> {
 		if (!this.panelOpen) await this.openPanel();
 		this.activateStoreForActiveFile();
+		// 栏里不显示任何提示：命令是显式动作，缺什么就在这里说清楚。
+		if (!this.store.fileKey) {
+			new Notice("先打开一篇笔记");
+			return;
+		}
+		if (this.data.apiKey.trim().length === 0) {
+			new Notice("先去设置里填 DeepSeek 密钥");
+			this.openSettings();
+			return;
+		}
+		if (!this.selectedTemplate()) {
+			new Notice("先去设置里选一个提示词模板文件夹");
+			this.openSettings();
+			return;
+		}
 		this.store.scanAll();
 		this.scheduleRepaint();
 	}

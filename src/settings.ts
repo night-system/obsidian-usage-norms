@@ -8,7 +8,7 @@ import {
 	TFolder,
 	setIcon,
 } from "obsidian";
-import { STRENGTH_LABEL, STRENGTH_MAX, Strength, isStrength } from "./engine";
+import { STRENGTHS, STRENGTH_LABEL, STRENGTH_MAX, Strength, isStrength } from "./engine";
 import type UsageNormsPlugin from "./main";
 import { createTemplateFile } from "./templates";
 
@@ -213,19 +213,20 @@ export class UsageNormsSettingTab extends PluginSettingTab {
 
 		// ------------------------------------------------------------ 思考强度
 		containerEl.createEl("h3", { text: "思考强度" });
-		new Setting(containerEl)
+		const strengthSetting = new Setting(containerEl)
 			.setName("一次最多几条")
-			.setDesc(`低 ${STRENGTH_MAX.low} 条 / 中 ${STRENGTH_MAX.medium} 条 / 高 ${STRENGTH_MAX.high} 条；强度变了会按新标准重扫。`)
-			.addDropdown((dropdown) => {
-				for (const level of ["low", "medium", "high"] as Strength[]) {
-					dropdown.addOption(level, STRENGTH_LABEL[level]);
-				}
-				dropdown.setValue(data.strength).onChange(async (value) => {
-					if (!isStrength(value)) return;
-					await this.plugin.setStrength(value);
-					this.rerender();
-				});
+			.setDesc(
+				`低 ${STRENGTH_MAX.low} 条 / 中 ${STRENGTH_MAX.medium} 条 / 高 ${STRENGTH_MAX.high} 条；强度变了会按新标准重扫。`
+			);
+		const seg = strengthSetting.controlEl.createDiv({ cls: "usage-norms-seg" });
+		for (const level of STRENGTHS) {
+			const button = seg.createEl("button", { cls: "usage-norms-seg-btn", text: STRENGTH_LABEL[level] });
+			if (level === data.strength) button.addClass("is-active");
+			button.addEventListener("click", async () => {
+				await this.plugin.setStrength(level);
+				this.rerender();
 			});
+		}
 
 		// ----------------------------------------------------------- 显示 reason
 		new Setting(containerEl)
