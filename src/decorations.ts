@@ -4,11 +4,23 @@ import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@
 import { Suggestion, fits, isDeletion } from "./engine";
 
 /**
+ * 正文标记的类名。
+ *
+ * **必须带 `cm-` 前缀，并且和 styles.css 里的选择器一字不差**：0.1.0～0.1.4
+ * 这里写的是 `usage-norms-ins`，而样式表写的是 `.cm-usage-norms-ins`，结果
+ * decoration 是画上去了、颜色却是 none —— 虚线和删除线一条都没显示出来。
+ * 改这里就同步改 styles.css（`npm test` 里有一条专门盯这个的用例）。
+ */
+const CLASS_DEL = "cm-usage-norms-del";
+const CLASS_INS = "cm-usage-norms-ins";
+const CLASS_ACTIVE = "cm-usage-norms-active";
+
+/**
  * 正文里的标记：只标 `quote` 那一小段。
  *
- * - 删除 → 删除线（`.usage-norms-del`）；
- * - 替换 / 补全 → 虚线（`.usage-norms-ins`）；
- * - 被选中的那条 → 加背景（`.usage-norms-active`）。
+ * - 删除 → 删除线（`.cm-usage-norms-del`）；
+ * - 替换 / 补全 → 虚线（`.cm-usage-norms-ins`）；
+ * - 被选中的那条 → 加背景（`.cm-usage-norms-active`）。
  *
  * 用 CM6 的 mark decoration，不改正文、不进撤销栈。
  */
@@ -69,8 +81,8 @@ export function applyMarks(
 			continue;
 		}
 		const active = i === activeIndex;
-		const classes = [isDeletion(suggestion) ? "usage-norms-del" : "usage-norms-ins"];
-		if (active) classes.push("usage-norms-active");
+		const classes = [isDeletion(suggestion) ? CLASS_DEL : CLASS_INS];
+		if (active) classes.push(CLASS_ACTIVE);
 		ranges.push(Decoration.mark({ class: classes.join(" ") }).range(suggestion.start, suggestion.end));
 	}
 	ranges.sort((a, b) => a.from - b.from);

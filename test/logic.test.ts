@@ -8,6 +8,8 @@
  *   3. 侧栏状态机（开栏不整篇扫、句末送检、预览被整句覆盖、记账、换模式重扫、作废在飞请求）
  */
 import * as assert from "node:assert";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { parseSuggestions, buildSystemPrompt, buildUserMessage, Suggestion } from "../src/engine";
 import { sentenceJustEnded, openSentence, splitSentences } from "../src/sentences";
 import { AssistStore } from "../src/store";
@@ -492,12 +494,46 @@ async function storeSuite(): Promise<void> {
 	});
 }
 
+// --------------------------------------------------- 4. 正文标记类名 ↔ 样式表
+
+/**
+ * 0.1.0～0.1.4「虚线一条都不显示」的根因：decoration 用的类名是
+ * `usage-norms-ins`，styles.css 里的选择器是 `.cm-usage-norms-ins`，
+ * 差一个前缀 —— 标记画上去了，样式却一条都没命中。这条用例盯住两边的对齐，
+ * 以后谁改类名忘了改样式会在这里就红。
+ */
+async function styleSuite(): Promise<void> {
+	console.log("\n# 正文标记类名 ↔ 样式表");
+	const root = path.join(__dirname, "..", "..");
+	const ts = fs.readFileSync(path.join(root, "src", "decorations.ts"), "utf8");
+	const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+	const names = Array.from(new Set(ts.match(/cm-usage-norms-[a-z]+/g) ?? [])).sort();
+
+	await test("decorations.ts 里能读到删除 / 替换 / 选中三个类名", () => {
+		for (const want of ["cm-usage-norms-del", "cm-usage-norms-ins", "cm-usage-norms-active"]) {
+			assert.ok(names.includes(want), `decorations.ts 里没有 ${want}（实际：${names.join(", ")}）`);
+		}
+	});
+
+	for (const name of names) {
+		await test(`styles.css 里有 .${name} 的样式`, () => {
+			assert.ok(css.includes(`.${name}`), `styles.css 缺少 .${name} 的选择器`);
+		});
+	}
+
+	await test("虚线用长写法写死，且带 !important", () => {
+		const block = css.slice(css.indexOf(".cm-usage-norms-ins"));
+		assert.ok(/text-decoration-style:\s*dashed\s*!important/.test(block.slice(0, 400)));
+	});
+}
+
 // ------------------------------------------------------------------ 入口
 
 (async () => {
 	await sentencesSuite();
 	await parseSuite();
 	await storeSuite();
+	await styleSuite();
 	console.log(`\n${passed} passed, ${failed} failed`);
 	if (failed > 0) {
 		console.log("\n失败项：\n" + failures.join("\n"));

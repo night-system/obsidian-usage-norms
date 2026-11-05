@@ -53,6 +53,9 @@ export class UsageNormsView extends ItemView {
 		root.empty();
 		root.addClass("usage-norms");
 		this.bodyEl = root.createDiv({ cls: "usage-norms-body" });
+		// 先用内存里的建议同步画一遍：iPad 键盘弹起会让 Obsidian 重建这个视图，
+		// 等 async 的 onPanelOpened 走完再画，中间会空一下；直接画不依赖模板 / 库。
+		this.render();
 	}
 
 	render(): void {

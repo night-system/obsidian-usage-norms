@@ -186,13 +186,17 @@ export default class UsageNormsPlugin extends Plugin {
 	 */
 	async onPanelOpened(): Promise<void> {
 		this.log(`panel-open leaves=${this.panelLeaves().length}`);
+		// 先挂当前笔记、把内存里的建议画上去 —— 这一步不能等模板刷新：
+		// iPad 键盘弹起会重建侧栏视图，库还没就绪时 await 会把面板空着。
+		this.activateStoreForActiveFile();
+		this.refreshViews();
 		try {
 			await this.library.refresh();
 		} catch (error) {
 			// 读模板失败不能把整个面板挂起（iPad 上库可能还没就绪）。
 			this.log(`templates refresh failed: ${(error as Error).message}`);
+			return;
 		}
-		this.activateStoreForActiveFile();
 		this.refreshViews();
 	}
 
