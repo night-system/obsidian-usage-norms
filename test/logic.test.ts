@@ -527,6 +527,36 @@ async function styleSuite(): Promise<void> {
 	});
 }
 
+// --------------------------------------------------- 5. 侧栏面板不缓存 DOM
+
+/**
+ * 0.1.5 的「iPad 键盘一抬，左栏就空」：视图把 body 节点缓存成了 `this.bodyEl`，
+ * Obsidian 重排侧栏、换掉内容容器之后，行全画进已脱离文档的孤儿节点。这条
+ * 用例盯住「不缓存 + 每次现查 + 有 onResize / 自愈巡检」，防止再退回去。
+ */
+async function panelDomSuite(): Promise<void> {
+	console.log("\n# 侧栏面板不缓存 DOM");
+	const root = path.join(__dirname, "..", "..");
+	const view = fs.readFileSync(path.join(root, "src", "view.ts"), "utf8");
+	const main = fs.readFileSync(path.join(root, "src", "main.ts"), "utf8");
+
+	await test("view.ts 不缓存 body 节点（没有 this.bodyEl）", () => {
+		assert.ok(!/this\.bodyEl/.test(view), "view.ts 里又出现了缓存的 this.bodyEl");
+	});
+
+	await test("view.ts 每次 render 现查 containerEl.children", () => {
+		assert.ok(view.includes("containerEl.children"), "应该现查 containerEl.children[1]，别缓存容器");
+	});
+
+	await test("view.ts 实现了 onResize（Obsidian 改视图尺寸时重画）", () => {
+		assert.ok(/onResize\s*\(\s*\)\s*:/.test(view), "缺少 onResize()");
+	});
+
+	await test("main.ts 有面板自愈巡检（healthCheck + setInterval）", () => {
+		assert.ok(main.includes("healthCheck") && main.includes("setInterval"), "缺少自愈巡检");
+	});
+}
+
 // ------------------------------------------------------------------ 入口
 
 (async () => {
@@ -534,6 +564,7 @@ async function styleSuite(): Promise<void> {
 	await parseSuite();
 	await storeSuite();
 	await styleSuite();
+	await panelDomSuite();
 	console.log(`\n${passed} passed, ${failed} failed`);
 	if (failed > 0) {
 		console.log("\n失败项：\n" + failures.join("\n"));

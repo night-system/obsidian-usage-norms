@@ -29,6 +29,9 @@ export default class UsageNormsPlugin extends Plugin {
 	private markedView: EditorView | null = null;
 	private repaintTimer: number | null = null;
 	private saveTimer: number | null = null;
+	/** 面板开着时的自愈巡检（iPad 键盘弹起 / 侧栏重排后把行画回活容器）。 */
+	private healTimer: number | null = null;
+	private lastHealLog = "";
 	private modeKeyAtLoad = "";
 	/**
 	 * 最近一次「真正在读的笔记」。
@@ -114,12 +117,19 @@ export default class UsageNormsPlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("layout-change", () => this.onLayoutChange()));
 
 		// 键盘弹起改的是视口尺寸：resize 也补一次重画（移动端 layout-change 不一定来）。
-		this.registerDomEvent(window, "resize", () => {
-			this.log(`window-resize ${window.innerWidth}x${window.innerHeight}`);
-			if (!this.panelOpen) return;
-			this.refreshViews();
-			this.scheduleRepaint();
-		});
+		this.registerDomEvent(window, "resize", () => this.onViewportChanged("window-resize"));
+
+		// iPad 的软键盘更可靠地体现在 visualViewport 上（有时 window 不 resize）。
+		const visual = window.visualViewport;
+		if (visual) {
+			const onVisual = () => this.onViewportChanged("visual-viewport");
+			visual.addEventListener("resize", onVisual);
+			visual.addEventListener("scroll", onVisual);
+			this.register(() => {
+				visual.removeEventListener("resize", onVisual);
+				visual.removeEventListener("scroll", onVisual);
+			});
+		}
 
 		// 模板文件被改 / 新增 / 删除 / 改名 → 重读模板；如果改的是当前模板就是换模式。
 		const onVaultChange = (file: { path: string }) => {
@@ -151,6 +161,7 @@ export default class UsageNormsPlugin extends Plugin {
 	onunload(): void {
 		if (this.repaintTimer !== null) window.clearTimeout(this.repaintTimer);
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+		this.stopHealthWatch();
 		void this.saveNow();
 		clearMarks(this.markedView);
 		this.app.workspace.detachLeavesOfType(VIEW_TYPE_USAGE_NORMS);
@@ -171,6 +182,8 @@ export default class UsageNormsPlugin extends Plugin {
 		}
 		this.app.workspace.leftSplit.expand();
 		this.app.workspace.revealLeaf(leaf);
+		this.startHealthWatch();
+		this.refreshViews();
 	}
 
 	closePanel(): void {
@@ -186,6 +199,7 @@ export default class UsageNormsPlugin extends Plugin {
 	 */
 	async onPanelOpened(): Promise<void> {
 		this.log(`panel-open leaves=${this.panelLeaves().length}`);
+		this.startHealthWatch();
 		// 先挂当前笔记、把内存里的建议画上去 —— 这一步不能等模板刷新：
 		// iPad 键盘弹起会重建侧栏视图，库还没就绪时 await 会把面板空着。
 		this.activateStoreForActiveFile();
@@ -216,6 +230,7 @@ export default class UsageNormsPlugin extends Plugin {
 				this.scheduleRepaint();
 				return;
 			}
+			this.stopHealthWatch();
 			clearMarks(this.markedView);
 			this.markedView = null;
 		}, 120);
@@ -232,6 +247,62 @@ export default class UsageNormsPlugin extends Plugin {
 			if (leaf.view instanceof UsageNormsView) views.push(leaf.view);
 		}
 		return views;
+	}
+
+	/** 视图尺寸变了（iPad 键盘弹起 / 侧栏开合）：补画正文标记，巡检拉起来。 */
+	onPanelResized(): void {
+		this.startHealthWatch();
+		this.scheduleRepaint();
+	}
+
+	/**
+	 * 自愈巡检：面板开着时每 400ms 看一眼「活容器里的行数」是否等于建议条数。
+	 *
+	 * iPad 键盘弹起时 Obsidian 会重排侧栏：视图实例还在、`onOpen` / `onResize`
+	 * 却不一定来，DOM 却可能已经被换掉 —— 只靠事件会漏。行数对不上就按当前
+	 * store 重画一遍，最多 400ms 补回来；对得上时什么都不做，不会闪。
+	 */
+	private startHealthWatch(): void {
+		if (this.healTimer !== null) return;
+		if (!this.panelOpen) return;
+		this.healTimer = window.setInterval(() => this.healthCheck(), 400);
+	}
+
+	private stopHealthWatch(): void {
+		if (this.healTimer === null) return;
+		window.clearInterval(this.healTimer);
+		this.healTimer = null;
+	}
+
+	private healthCheck(): void {
+		if (!this.panelOpen) {
+			this.stopHealthWatch();
+			return;
+		}
+		const want = this.store.items.length;
+		for (const view of this.panelViews()) {
+			const rows = view.rowCount;
+			if (rows === want) continue;
+			const line = `heal rows=${rows} want=${want} live=${view.live}`;
+			if (line !== this.lastHealLog) {
+				this.lastHealLog = line;
+				this.log(line);
+			}
+			try {
+				view.render();
+			} catch (error) {
+				this.log(`heal failed: ${(error as Error).message}`);
+			}
+		}
+	}
+
+	/** 视口变了（键盘弹出 / 收起）：重画面板 + 正文标记，并开着巡检。 */
+	private onViewportChanged(source: string): void {
+		this.log(`${source} ${window.innerWidth}x${window.innerHeight}`);
+		if (!this.panelOpen) return;
+		this.startHealthWatch();
+		this.refreshViews();
+		this.scheduleRepaint();
 	}
 
 	private activateStoreForActiveFile(): void {
@@ -358,9 +429,16 @@ export default class UsageNormsPlugin extends Plugin {
 				this.panelLeaves().length
 			} active=${this.store.active}`
 		);
+		this.startHealthWatch();
 		this.refreshViews();
 		this.activateStoreForActiveFile();
 		this.scheduleRepaint();
+		// 侧栏重排 / 键盘动画结束后再补两次：有时事件先到、容器后换。
+		for (const delay of [150, 600]) {
+			window.setTimeout(() => {
+				if (this.panelOpen) this.refreshViews();
+			}, delay);
+		}
 	}
 
 	/** CM6 只用来补光标位置（正文变化由 editor-change 管）。 */
