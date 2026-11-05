@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-usage-norms",
+  "version": "0.1.0",
+  "description": "Obsidian usage-norms plugin: left sidebar writing suggestions driven by your own prompt templates",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "esbuild test/logic.test.ts --bundle --platform=node --format=cjs --outfile=test/.build/logic.cjs --alias:obsidian=./test/stub-obsidian.ts && node test/.build/logic.cjs"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "writing",
+    "deepseek"
+  ],
+  "author": "night-system",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "latest",
+    "tslib": "^2.6.0",
+    "typescript": "^5.4.0"
+  }
+}
