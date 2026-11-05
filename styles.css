@@ -138,6 +138,31 @@
 	border-radius: 2px;
 }
 
+/* ============================================================ 面板看不见时，一条标记都不画
+ *
+ * 左侧栏没打开、侧栏停在别的标签（文件列表 / 搜索 …）、iPad 抽屉收回时，建议本身
+ * 看不见，`✓` `×` 也点不到 —— 正文里再画虚线 / 删除线只是噪音。
+ *
+ * 逻辑上 main.ts 已经「看不见就不画」（`panelVisible`），这一层是兜底：
+ * `body` 上没有 `usage-norms-panel-visible`（默认状态也没有），三条标记的样式全部
+ * 作废。类名在 `src/visibility.ts` 里，`npm test` 有一条用例比对两边，改坏了会红。
+ */
+
+body:not(.usage-norms-panel-visible) .cm-s-obsidian .cm-usage-norms-del,
+body:not(.usage-norms-panel-visible) .markdown-source-view .cm-usage-norms-del,
+body:not(.usage-norms-panel-visible) .cm-editor .cm-usage-norms-del,
+body:not(.usage-norms-panel-visible) .cm-s-obsidian .cm-usage-norms-ins,
+body:not(.usage-norms-panel-visible) .markdown-source-view .cm-usage-norms-ins,
+body:not(.usage-norms-panel-visible) .cm-editor .cm-usage-norms-ins,
+body:not(.usage-norms-panel-visible) .cm-s-obsidian .cm-usage-norms-active,
+body:not(.usage-norms-panel-visible) .markdown-source-view .cm-usage-norms-active,
+body:not(.usage-norms-panel-visible) .cm-editor .cm-usage-norms-active {
+	text-decoration-line: none !important;
+	text-decoration-style: solid !important;
+	color: inherit !important;
+	background: none !important;
+}
+
 /* ============================================================ 设置页 */
 
 .usage-norms-settings .usage-norms-warn {

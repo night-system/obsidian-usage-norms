@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { parseSuggestions, buildSystemPrompt, buildUserMessage, Suggestion } from "../src/engine";
 import { sentenceJustEnded, openSentence, splitSentences } from "../src/sentences";
 import { AssistStore } from "../src/store";
+import { PANEL_VISIBLE_CLASS, PanelProbe, isPanelVisible } from "../src/visibility";
 
 let passed = 0;
 let failed = 0;
@@ -557,6 +558,94 @@ async function panelDomSuite(): Promise<void> {
 	});
 }
 
+// --------------------------------------------------- 6. 面板可见性（正文标记的开关）
+
+/**
+ * 用户的要求：左侧栏**没打开**、或者侧栏**没停在这一栏**（文件列表 / 搜索 …）时，
+ * 正文里不要出现语法修正的下划虚线 / 删除线 —— 建议本身看不见，`✓` `×` 也点不到，
+ * 画线只是噪音。
+ *
+ * 判据在 `src/visibility.ts`（纯函数），下面把「有叶子但看不见」的每种形态各跑一条；
+ * 再用静态检查盯住两件事：CSS 兜底规则还在、`repaint()` 真的看了可见性。
+ */
+async function visibilitySuite(): Promise<void> {
+	console.log("\n# 面板可见性（正文标记的开关）");
+
+	/** 默认：面板正常挂在左侧栏里、有尺寸、没被隐藏。 */
+	const seen: PanelProbe = {
+		hasLeaf: true,
+		connected: true,
+		shown: true,
+		width: 260,
+		height: 620,
+	};
+
+	await test("面板看得见 → 画标记", () => {
+		assert.strictEqual(isPanelVisible(seen), true);
+	});
+
+	await test("根本没有面板叶子（没开过 / 已经关掉）→ 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, hasLeaf: false }), false);
+	});
+
+	await test("容器脱离了文档 → 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, connected: false }), false);
+	});
+
+	await test("左侧栏被收起（sidedock collapsed）→ 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, dockCollapsed: true }), false);
+	});
+
+	await test("侧栏里切到了别的标签（容器 display:none）→ 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, shown: false }), false);
+	});
+
+	await test("容器被压成 0 宽 / 0 高（收起动画里）→ 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, width: 0 }), false);
+		assert.strictEqual(isPanelVisible({ ...seen, height: 0 }), false);
+	});
+
+	await test("尺寸拿不到（NaN）→ 不画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, width: Number.NaN }), false);
+	});
+
+	await test("老版本没有 isShown（undefined）但尺寸正常 → 照常画", () => {
+		assert.strictEqual(isPanelVisible({ ...seen, shown: undefined }), true);
+	});
+
+	const root = path.join(__dirname, "..", "..");
+	const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+	const main = fs.readFileSync(path.join(root, "src", "main.ts"), "utf8");
+
+	await test("CSS 兜底：没有面板可见类时三条标记全部不画", () => {
+		const at = css.indexOf(`body:not(.${PANEL_VISIBLE_CLASS})`);
+		assert.ok(at >= 0, `styles.css 里缺少 body:not(.${PANEL_VISIBLE_CLASS}) 兜底规则`);
+		const block = css.slice(at, at + 1200);
+		for (const cls of ["cm-usage-norms-del", "cm-usage-norms-ins", "cm-usage-norms-active"]) {
+			assert.ok(block.includes(cls), `兜底规则里少了 ${cls}`);
+		}
+		assert.ok(
+			/text-decoration-line:\s*none\s*!important/.test(block),
+			"兜底规则没有把 text-decoration-line 关掉"
+		);
+	});
+
+	await test("样式表里的可见类名和 visibility.ts 一致", () => {
+		assert.ok(css.includes(`.${PANEL_VISIBLE_CLASS}`), "styles.css 里没有这个类名");
+	});
+
+	await test("repaint() 只在面板看得见时才去拿编辑器画标记", () => {
+		const at = main.indexOf("private repaint(): void");
+		assert.ok(at >= 0, "main.ts 里找不到 repaint()");
+		const body = main.slice(at, at + 900);
+		assert.ok(body.includes("panelVisible"), "repaint 没看 panelVisible：面板收起时还会往正文画线");
+		assert.ok(
+			/const cm = visible \? this\.activeCm\(\) : null/.test(body),
+			"repaint 拿 cm 时没有按可见性分流"
+		);
+	});
+}
+
 // ------------------------------------------------------------------ 入口
 
 (async () => {
@@ -565,6 +654,7 @@ async function panelDomSuite(): Promise<void> {
 	await storeSuite();
 	await styleSuite();
 	await panelDomSuite();
+	await visibilitySuite();
 	console.log(`\n${passed} passed, ${failed} failed`);
 	if (failed > 0) {
 		console.log("\n失败项：\n" + failures.join("\n"));

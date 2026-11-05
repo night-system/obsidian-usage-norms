@@ -14,11 +14,15 @@ import { TemplateLibrary, PromptTemplate } from "./templates";
 import { AssistStore } from "./store";
 import { Strength, isStrength, requestSuggestions } from "./engine";
 import { applyMarks, clearMarks, marksExtension } from "./decorations";
+import { PANEL_VISIBLE_CLASS, isPanelVisible } from "./visibility";
 import { EditorView } from "@codemirror/view";
 import type { ViewUpdate } from "@codemirror/view";
 
 /** 「已经算过的句子」最多留多少页，超了按最后使用时间丢最旧的。 */
 const MAX_PAGES = 500;
+
+/** 面板可见性多久对一次（毫秒）。收起侧栏 / 切标签都没有可靠事件，只能巡检。 */
+const VISIBILITY_TICK_MS = 300;
 
 export default class UsageNormsPlugin extends Plugin {
 	data: UsageNormsData = { ...normalizeData(null), scans: {} };
@@ -32,6 +36,10 @@ export default class UsageNormsPlugin extends Plugin {
 	/** 面板开着时的自愈巡检（iPad 键盘弹起 / 侧栏重排后把行画回活容器）。 */
 	private healTimer: number | null = null;
 	private lastHealLog = "";
+	/** 正文画不画虚线 / 删除线只看这一条：面板看不看得见（见 visibility.ts）。 */
+	private lastPanelVisible = false;
+	/** 可见性巡检：收起侧栏 / 切到别的标签不一定有事件，隔一会儿对一次。 */
+	private visibilityTimer: number | null = null;
 	private modeKeyAtLoad = "";
 	/**
 	 * 最近一次「真正在读的笔记」。
@@ -131,6 +139,10 @@ export default class UsageNormsPlugin extends Plugin {
 			});
 		}
 
+		// 面板可见性巡检：收起侧栏、切到别的标签都可能不触发事件，固定隔一会儿对一次。
+		// 只有「看不看得见」真的变了才动手（正文标记跟着出现 / 消失）。
+		this.visibilityTimer = window.setInterval(() => this.syncPanelVisibility(), VISIBILITY_TICK_MS);
+
 		// 模板文件被改 / 新增 / 删除 / 改名 → 重读模板；如果改的是当前模板就是换模式。
 		const onVaultChange = (file: { path: string }) => {
 			if (!this.isInTemplateFolder(file.path)) return;
@@ -162,8 +174,11 @@ export default class UsageNormsPlugin extends Plugin {
 		if (this.repaintTimer !== null) window.clearTimeout(this.repaintTimer);
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.stopHealthWatch();
+		this.stopVisibilityWatch();
 		void this.saveNow();
 		clearMarks(this.markedView);
+		// 插件卸载后正文不该还留着虚线 / 删除线（body 上的类名一并摘掉）。
+		this.setPanelClass(false);
 		this.app.workspace.detachLeavesOfType(VIEW_TYPE_USAGE_NORMS);
 	}
 
@@ -184,6 +199,8 @@ export default class UsageNormsPlugin extends Plugin {
 		this.app.workspace.revealLeaf(leaf);
 		this.startHealthWatch();
 		this.refreshViews();
+		// 面板一露头就把正文标记补上（不必等下一次巡检）。
+		this.syncPanelVisibility();
 	}
 
 	closePanel(): void {
@@ -327,6 +344,94 @@ export default class UsageNormsPlugin extends Plugin {
 	 */
 	private get panelOpen(): boolean {
 		return this.panelLeaves().length > 0;
+	}
+
+	/**
+	 * 面板此刻是不是真的在屏幕上 —— **正文要不要画虚线 / 删除线只看这一条**。
+	 *
+	 * 「有叶子」不等于「看得见」：左侧栏可以收起（sidedock collapsed）、侧栏里可以
+	 * 停在别的标签（Obsidian 把非当前叶子 `display: none`）、iPad 上抽屉可以收回。
+	 * 这三种情况下建议都看不见、`✓` `×` 都点不到，往正文画线只是噪音。
+	 *
+	 * 判据本身在 `visibility.ts` 里（纯函数，`npm test` 逐条覆盖），这里只负责把
+	 * Obsidian 的 DOM / API 事实收集成 probe。
+	 */
+	private get panelVisible(): boolean {
+		const leaves = this.panelLeaves();
+		if (leaves.length === 0) return false;
+		for (const leaf of leaves) {
+			const el = (leaf.view as unknown as { containerEl?: HTMLElement }).containerEl;
+			if (!el) continue;
+			let shown: boolean | undefined;
+			try {
+				shown = typeof el.isShown === "function" ? el.isShown() : undefined;
+			} catch {
+				// 老版本没有 isShown / 元素正在销毁：交给尺寸判据。
+				shown = undefined;
+			}
+			const rect = el.getBoundingClientRect();
+			const visible = isPanelVisible({
+				hasLeaf: true,
+				connected: el.isConnected !== false,
+				shown,
+				width: rect.width,
+				height: rect.height,
+				dockCollapsed: this.dockCollapsed(leaf),
+			});
+			if (visible) return true;
+		}
+		return false;
+	}
+
+	/** 叶子所在的那个分栏（左侧栏 / 右侧栏 / 移动端抽屉）是不是收起了。 */
+	private dockCollapsed(leaf: WorkspaceLeaf): boolean {
+		const ws = this.app.workspace as unknown as {
+			leftSplit?: { collapsed?: boolean; containerEl?: HTMLElement };
+			rightSplit?: { collapsed?: boolean; containerEl?: HTMLElement };
+		};
+		const leafEl = (leaf as unknown as { containerEl?: HTMLElement }).containerEl;
+		let dockEl: HTMLElement | null = null;
+		try {
+			dockEl = leafEl?.closest?.(
+				".workspace-split.mod-left-split, .workspace-split.mod-right-split"
+			) as HTMLElement | null;
+		} catch {
+			dockEl = null;
+		}
+		if (dockEl && ws.leftSplit?.containerEl === dockEl) return ws.leftSplit?.collapsed === true;
+		if (dockEl && ws.rightSplit?.containerEl === dockEl) return ws.rightSplit?.collapsed === true;
+		// 移动端：叶子挂在抽屉（WorkspaceMobileDrawer）里，收起状态在 parent 上。
+		const parent = (leaf as unknown as { parent?: { collapsed?: boolean } }).parent;
+		return parent?.collapsed === true;
+	}
+
+	/**
+	 * 面板可见性变了：改 `body` 上的类名（CSS 兜底），并立刻重画 / 清掉正文标记。
+	 *
+	 * 类名是「看得见」才有的：**没有 `usage-norms-panel-visible` 就一条标记都不画**，
+	 * 所以这里就算漏一次，正文里也不会真把线画出来，最多晚 300ms 消失。
+	 */
+	private syncPanelVisibility(): void {
+		const visible = this.panelVisible;
+		if (visible === this.lastPanelVisible) return;
+		this.lastPanelVisible = visible;
+		this.setPanelClass(visible);
+		this.log(`panel visible=${visible} leaves=${this.panelLeaves().length}`);
+		this.scheduleRepaint();
+	}
+
+	private stopVisibilityWatch(): void {
+		if (this.visibilityTimer === null) return;
+		window.clearInterval(this.visibilityTimer);
+		this.visibilityTimer = null;
+	}
+
+	/** 给 `body` 挂 / 摘可见性类名（幂等；拿不到 body 就跳过）。 */
+	private setPanelClass(visible: boolean): void {
+		const body = this.app.workspace.containerEl?.ownerDocument?.body;
+		if (!body) return;
+		if (visible) body.addClass(PANEL_VISIBLE_CLASS);
+		else body.removeClass(PANEL_VISIBLE_CLASS);
 	}
 
 	// ------------------------------------------------------------------ 编辑
@@ -716,7 +821,15 @@ export default class UsageNormsPlugin extends Plugin {
 	}
 
 	private repaint(): void {
-		const cm = this.panelOpen ? this.activeCm() : null;
+		// 正文标记的开关只有一条：面板看得见才画。看不见（侧栏收起 / 停在别的标签 /
+		// 抽屉收回）时连 cm 都不去拿，markedView 一律清掉，正文里一根线都不留。
+		const visible = this.panelVisible;
+		if (visible !== this.lastPanelVisible) {
+			this.lastPanelVisible = visible;
+			this.log(`panel visible=${visible}`);
+		}
+		this.setPanelClass(visible);
+		const cm = visible ? this.activeCm() : null;
 		if (this.markedView && this.markedView !== cm) {
 			clearMarks(this.markedView);
 			this.markedView = null;
