@@ -392,6 +392,33 @@ async function storeSuite(): Promise<void> {
 		assert.strictEqual(data.scans["d.md"].sentences.length, 2);
 	});
 
+	await test("侧栏被收起再重建（iPad 键盘弹起）：建议还在，也不重新送检", async () => {
+		const { store, requests } = makeStore();
+		store.activate("g.md", "", 0);
+		store.onText("今天天气很好。", 7);
+		await flush();
+		assert.strictEqual(store.items.length, 1);
+		const before = requests.length;
+
+		// Obsidian 收侧栏 / 重建视图：onClose → onOpen
+		store.suspend();
+		store.activate("g.md", "今天天气很好。", 7);
+
+		assert.strictEqual(store.items.length, 1);
+		assert.strictEqual(store.items[0].suggestion.source, "很好");
+		assert.strictEqual(requests.length, before);
+	});
+
+	await test("换到另一篇笔记仍然清空", async () => {
+		const { store } = makeStore();
+		store.activate("h1.md", "", 0);
+		store.onText("今天天气很好。", 7);
+		await flush();
+		assert.strictEqual(store.items.length, 1);
+		store.activate("h2.md", "", 0);
+		assert.strictEqual(store.items.length, 0);
+	});
+
 	await test("请求回来时原文已经变了 → 结果丢掉，不挂在错的位置", async () => {
 		let release: (() => void) | null = null;
 		const gate = new Promise<void>((resolve) => {

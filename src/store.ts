@@ -54,6 +54,8 @@ export interface StoreHost {
 	send?: (request: SuggestRequest) => Promise<Suggestion[]>;
 	/** 测试用：把「停手送预览」的等待调短。 */
 	previewDelayMs?: number;
+	/** 排查用日志（只在导出时落盘）。 */
+	log?: (message: string) => void;
 }
 
 /** 简单稳定的字符串哈希（扫描模式指纹用）。 */
@@ -107,11 +109,20 @@ export class AssistStore {
 
 	// ------------------------------------------------------------------ 生命周期
 
-	/** 打开面板：把当前正文当基线，不自动整篇扫。 */
+	/**
+	 * 面板可见 / 重新挂上当前笔记。
+	 *
+	 * 同一篇笔记会**保留已有建议**（iPad 上键盘弹起会让 Obsidian 重建侧栏
+	 * 视图、触发 onClose/onOpen，不能因此把建议清空）；只有真的换了笔记才重置。
+	 */
 	activate(fileKey: string, text: string, caret: number): void {
-		if (this.active && this.fileKey === fileKey) {
-			this.caret = caret;
+		if (fileKey.length > 0 && this.fileKey === fileKey) {
+			const old = this.text;
+			this.active = true;
 			this.text = text;
+			this.caret = caret;
+			if (old !== text) this.rebase(old, text);
+			this.host.notify();
 			return;
 		}
 		this.resetState();
@@ -123,7 +134,22 @@ export class AssistStore {
 		this.host.notify();
 	}
 
-	/** 关面板：取消计时器、丢掉排队 / 在飞的请求和正文标记。 */
+	/**
+	 * 面板暂时不可见（侧栏被收起、键盘弹起、切走工作区）：停网、停计时器，
+	 * 但**保留建议**，下次可见时原样恢复。
+	 */
+	suspend(): void {
+		this.active = false;
+		this.clearPreviewTimer();
+		this.cancelAll();
+	}
+
+	/** 重新可见但拿不到正文（没有活动笔记）：只把门打开，不动已有状态。 */
+	resume(): void {
+		this.active = true;
+	}
+
+	/** 彻底关掉（卸载插件）：建议全部丢掉。 */
 	deactivate(): void {
 		this.active = false;
 		this.fileKey = "";
@@ -175,11 +201,7 @@ export class AssistStore {
 		this.caret = pos;
 		this.rebase(oldText, text);
 		if (!this.active) {
-			if (this.items.length > 0) {
-				this.items = [];
-				this.activeIndex = null;
-				this.host.notify();
-			}
+			// 面板不可见时仍在写：偏移已经跟着对齐，建议留着等可见时再判断。
 			return;
 		}
 		if (text.trim().length === 0) {
@@ -506,6 +528,7 @@ export class AssistStore {
 
 	private async run(job: Job): Promise<void> {
 		const template = this.host.template();
+		this.host.log?.(`req start len=${job.source.length} preview=${job.preview} scan=${job.scan}`);
 		try {
 			if (!template) throw new UsageNormsError("no-template", "没有可用的模板");
 			const suggestions = await this.send({
@@ -517,9 +540,11 @@ export class AssistStore {
 			});
 			if (job.cancelled) return;
 			this.applyResult(job, suggestions);
+			this.host.log?.(`req ok n=${suggestions.length} items=${this.items.length}`);
 		} catch (error) {
 			if (job.cancelled) return;
 			this.error = error instanceof UsageNormsError ? error.message : "出错了";
+			this.host.log?.(`req err ${this.error}`);
 			if (error instanceof UsageNormsError && error.details) {
 				console.warn("[usage-norms]", error.code, error.details);
 			}

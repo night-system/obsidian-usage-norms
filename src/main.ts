@@ -3,6 +3,7 @@ import {
 	MarkdownFileInfo,
 	MarkdownView,
 	Notice,
+	Platform,
 	Plugin,
 	WorkspaceLeaf,
 	normalizePath,
@@ -37,6 +38,17 @@ export default class UsageNormsPlugin extends Plugin {
 	 */
 	private lastMarkdown: MarkdownView | null = null;
 
+	/** 调试日志（只留最近 400 条），命令「导出调试日志」把它写成笔记。 */
+	private logBuffer: string[] = [];
+	private lastStoreLog = "";
+
+	/** 记一行调试日志（不会自动写盘，只在命令导出时落成一个笔记）。 */
+	log(message: string): void {
+		const stamp = new Date().toISOString().slice(11, 23);
+		this.logBuffer.push(`${stamp} ${message}`);
+		if (this.logBuffer.length > 400) this.logBuffer.splice(0, this.logBuffer.length - 400);
+	}
+
 	async onload(): Promise<void> {
 		this.data = normalizeData(await this.loadData());
 		this.library = new TemplateLibrary(this.app);
@@ -48,8 +60,12 @@ export default class UsageNormsPlugin extends Plugin {
 			template: () => this.selectedTemplate() ?? null,
 			notify: () => this.onStoreChanged(),
 			persist: () => this.schedulePersist(),
+			log: (message) => this.log(message),
 		});
 		this.modeKeyAtLoad = this.modeKey();
+		this.log(
+			`load version=${this.manifest.version} mobile=${Platform.isMobile} apiKey=${this.data.apiKey.trim().length > 0} template=${this.selectedTemplate()?.path ?? "(none)"}`
+		);
 
 		// 正文标记（CM6 decoration）+ 光标变化
 		this.registerEditorExtension(marksExtension((update) => this.onViewUpdate(update)));
@@ -81,6 +97,11 @@ export default class UsageNormsPlugin extends Plugin {
 				this.onStoreChanged();
 			},
 		});
+		this.addCommand({
+			id: "export-debug-log",
+			name: "导出调试日志（排查用）",
+			callback: () => void this.exportDebugLog(),
+		});
 
 		this.addSettingTab(new UsageNormsSettingTab(this.app, this));
 
@@ -91,6 +112,8 @@ export default class UsageNormsPlugin extends Plugin {
 		);
 		this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.onActiveLeafChange()));
 		this.registerEvent(this.app.workspace.on("file-open", () => this.onActiveLeafChange()));
+		// iPad 键盘弹起 / 侧栏收起重建都会走 layout-change：重画面板和正文标记。
+		this.registerEvent(this.app.workspace.on("layout-change", () => this.onLayoutChange()));
 
 		// 模板文件被改 / 新增 / 删除 / 改名 → 重读模板；如果改的是当前模板就是换模式。
 		const onVaultChange = (file: { path: string }) => {
@@ -158,7 +181,13 @@ export default class UsageNormsPlugin extends Plugin {
 
 	async onPanelOpened(view: UsageNormsView): Promise<void> {
 		this.panels.add(view);
-		await this.library.refresh();
+		this.log(`panel-open panels=${this.panels.size}`);
+		try {
+			await this.library.refresh();
+		} catch (error) {
+			// 读模板失败不能把整个面板挂起（iPad 上库可能还没就绪）。
+			this.log(`templates refresh failed: ${(error as Error).message}`);
+		}
 		this.activateStoreForActiveFile();
 		view.render();
 	}
@@ -166,26 +195,43 @@ export default class UsageNormsPlugin extends Plugin {
 	onPanelClosed(view: UsageNormsView): void {
 		this.panels.delete(view);
 		this.views.delete(view);
-		if (this.panels.size === 0) {
-			this.store.deactivate();
+		this.log(`panel-close panels=${this.panels.size} leaves=${this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length}`);
+		if (this.panels.size > 0) return;
+		// 先别急着挂起：iPad 键盘弹起时 Obsidian 会收起 / 重建侧栏，
+		// 视图可能马上又被创建回来。800ms 后确认真的没有叶子了再停。
+		window.setTimeout(() => {
+			if (this.panels.size > 0) return;
+			if (this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length > 0) return;
+			this.log("panel-gone -> suspend");
+			this.store.suspend();
 			clearMarks(this.markedView);
 			this.markedView = null;
-		}
+		}, 800);
 	}
 
 	private activateStoreForActiveFile(): void {
 		const info = this.activeEditorInfo();
 		if (!info) {
-			this.store.activate("", "", 0);
+			// 拿不到正文（侧栏刚重建、焦点还在键盘上）：保留已有建议，门先开着。
+			this.store.resume();
+			this.log("activate(resume) no active markdown");
+			this.scheduleRepaint();
 			return;
 		}
+		this.log(`activate file=${info.file.path} len=${info.text.length}`);
 		this.store.activate(info.file.path, info.text, info.caret);
 		this.scheduleRepaint();
 	}
 
-	/** 面板是不是开着（关着的时候不联网、不标记）。 */
+	/**
+	 * 面板是不是还挂在工作区里。
+	 *
+	 * 不看 onOpen/onClose 的记账，直接问工作区有没有这个叶子：iPad 上键盘弹起
+	 * 会触发侧栏收起 / 视图重建，记账会瞬间变成 0，但面板其实还在。
+	 */
 	private get panelOpen(): boolean {
-		return this.panels.size > 0;
+		if (this.panels.size > 0) return true;
+		return this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length > 0;
 	}
 
 	// ------------------------------------------------------------------ 编辑
@@ -201,7 +247,7 @@ export default class UsageNormsPlugin extends Plugin {
 		};
 	}
 
-	/** 当前该服务的笔记：优先 activeLeaf，其次最近一次看过的 MarkdownView。 */
+	/** 当前该服务的笔记：优先 activeLeaf，其次最近看过的，最后按已记录的文件路径找。 */
 	private currentMarkdownView(): MarkdownView | null {
 		const active = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (active && active.file) {
@@ -215,6 +261,24 @@ export default class UsageNormsPlugin extends Plugin {
 		}
 		const last = this.lastMarkdown;
 		if (last && last.file && last.leaf && last.leaf.view === last) return last;
+		// 侧栏重建过、lastMarkdown 指向已经销毁的视图：按 store 记的文件路径在
+		// 现有 markdown leaf 里找同一个文件（iPad 键盘弹起后就是这条路径）。
+		const leaves = this.app.workspace.getLeavesOfType("markdown");
+		const want = this.store?.fileKey ?? "";
+		if (want.length > 0) {
+			for (const item of leaves) {
+				if (item.view instanceof MarkdownView && item.view.file?.path === want) {
+					this.lastMarkdown = item.view;
+					return item.view;
+				}
+			}
+		}
+		for (const item of leaves) {
+			if (item.view instanceof MarkdownView && item.view.file) {
+				this.lastMarkdown = item.view;
+				return item.view;
+			}
+		}
 		this.lastMarkdown = null;
 		return null;
 	}
@@ -228,25 +292,40 @@ export default class UsageNormsPlugin extends Plugin {
 	private onEditorChange(editor: Editor, info: MarkdownView | MarkdownFileInfo): void {
 		if (info instanceof MarkdownView && info.file) this.lastMarkdown = info;
 		if (!this.panelOpen) return;
-		const file = info.file;
-		if (!file || file.extension !== "md") return;
+		// iPad 上 info.file 偶尔为空：退回最近看过的笔记，别把事件整个丢掉。
+		const file = info.file ?? this.lastMarkdown?.file ?? null;
+		if (file && file.extension !== "md") return;
 		const text = editor.getValue();
 		const caret = editor.posToOffset(editor.getCursor());
-		if (this.store.fileKey !== file.path) {
-			this.store.switchFile(file.path, text, caret);
+		if (file && this.store.fileKey !== file.path) {
+			this.store.activate(file.path, text, caret);
+		} else if (!this.store.active) {
+			this.store.resume();
 		}
+		this.log(
+			`edit file=${file ? file.path : "(none)"} len=${text.length} caret=${caret} active=${this.store.active} key=${this.store.fileKey} items=${this.store.items.length}`
+		);
 		this.store.onText(text, caret);
 		this.scheduleRepaint();
 	}
 
 	private onActiveLeafChange(): void {
 		if (!this.panelOpen) return;
-		const info = this.activeEditorInfo();
-		if (!info) return;
-		if (this.store.fileKey !== info.file.path) {
-			this.store.switchFile(info.file.path, info.text, info.caret);
-			this.scheduleRepaint();
-		}
+		this.log("active-leaf-change");
+		this.activateStoreForActiveFile();
+	}
+
+	/** 布局变了（键盘、窗口尺寸、侧栏收起/重建）：把面板和标记重新贴上去。 */
+	private onLayoutChange(): void {
+		if (!this.panelOpen) return;
+		this.log(
+			`layout-change viewport=${window.innerWidth}x${window.innerHeight} leaves=${
+				this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length
+			} panels=${this.panels.size} active=${this.store.active}`
+		);
+		this.refreshViews();
+		this.activateStoreForActiveFile();
+		this.scheduleRepaint();
 	}
 
 	/** CM6 只用来补光标位置（正文变化由 editor-change 管）。 */
@@ -436,6 +515,34 @@ export default class UsageNormsPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * 把内存里的调试日志写成一篇笔记（放在库根目录），用于排查「键盘弹起后
+	 * 不再出建议」这类只在真机上出现的问题。日志只有事件和长度，没有正文。
+	 */
+	async exportDebugLog(): Promise<void> {
+		const lines = [
+			"# 用语规范调试日志",
+			"",
+			`插件版本：${this.manifest.version}`,
+			`导出时间：${new Date().toLocaleString()}`,
+			`平台：${Platform.isMobile ? "mobile" : "desktop"}`,
+			`视口：${window.innerWidth}x${window.innerHeight}`,
+			`data：apiKey=${this.data.apiKey.trim().length > 0} template=${this.selectedTemplate()?.path ?? "(none)"} strength=${this.data.strength}`,
+			`store：active=${this.store.active} file=${this.store.fileKey || "(none)"} items=${this.store.items.length}`,
+			"",
+			"```",
+			...this.logBuffer,
+			"```",
+			"",
+		];
+		try {
+			await this.app.vault.adapter.write("用语规范调试.md", lines.join("\n"));
+			new Notice("调试日志已写到库根目录「用语规范调试.md」");
+		} catch (error) {
+			new Notice(`写日志失败：${(error as Error).message}`);
+		}
+	}
+
 	async clearScanRecord(pageKey: string): Promise<void> {
 		if (pageKey.length === 0) this.data.scans = {};
 		else delete this.data.scans[pageKey];
@@ -446,6 +553,13 @@ export default class UsageNormsPlugin extends Plugin {
 
 	/** store 里任何状态变化：重画侧栏 + 正文标记。 */
 	private onStoreChanged(): void {
+		const snapshot = `items=${this.store.items.length} loading=${this.store.loading} active=${this.store.active} file=${
+			this.store.fileKey
+		} err=${this.store.error ?? ""}`;
+		if (snapshot !== this.lastStoreLog) {
+			this.lastStoreLog = snapshot;
+			this.log(`store ${snapshot}`);
+		}
 		this.refreshViews();
 		this.scheduleRepaint();
 	}
