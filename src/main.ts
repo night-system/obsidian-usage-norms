@@ -14,7 +14,8 @@ import { TemplateLibrary, PromptTemplate } from "./templates";
 import { AssistStore } from "./store";
 import { Strength, isStrength, requestSuggestions } from "./engine";
 import { applyMarks, clearMarks, marksExtension } from "./decorations";
-import type { EditorView, ViewUpdate } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
+import type { ViewUpdate } from "@codemirror/view";
 
 /** 「已经算过的句子」最多留多少页，超了按最后使用时间丢最旧的。 */
 const MAX_PAGES = 500;
@@ -24,8 +25,7 @@ export default class UsageNormsPlugin extends Plugin {
 	library!: TemplateLibrary;
 	store!: AssistStore;
 
-	private views = new Set<UsageNormsView>();
-	private panels = new Set<UsageNormsView>();
+	// 不缓存视图实例：活着的面板一律用 `getLeavesOfType` 现查（todo-panel 的做法）。
 	private markedView: EditorView | null = null;
 	private repaintTimer: number | null = null;
 	private saveTimer: number | null = null;
@@ -42,6 +42,7 @@ export default class UsageNormsPlugin extends Plugin {
 	private logBuffer: string[] = [];
 	private lastStoreLog = "";
 	private lastMetrics = "";
+	private lastRepaintLog = "";
 
 	/** 记一行调试日志（不会自动写盘，只在命令导出时落成一个笔记）。 */
 	log(message: string): void {
@@ -71,11 +72,7 @@ export default class UsageNormsPlugin extends Plugin {
 		// 正文标记（CM6 decoration）+ 光标变化
 		this.registerEditorExtension(marksExtension((update) => this.onViewUpdate(update)));
 
-		this.registerView(VIEW_TYPE_USAGE_NORMS, (leaf: WorkspaceLeaf) => {
-			const view = new UsageNormsView(leaf, this);
-			this.views.add(view);
-			return view;
-		});
+		this.registerView(VIEW_TYPE_USAGE_NORMS, (leaf: WorkspaceLeaf) => new UsageNormsView(leaf, this));
 
 		this.addRibbonIcon("sparkles", "用语规范：打开左侧面板", () => void this.openPanel());
 
@@ -145,14 +142,7 @@ export default class UsageNormsPlugin extends Plugin {
 
 		// 插件加载时如果面板本来就开着（工作区恢复），补一次激活。
 		this.app.workspace.onLayoutReady(() => {
-			const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS);
-			for (const leaf of leaves) {
-				const view = leaf.view;
-				if (view instanceof UsageNormsView) {
-					this.panels.add(view);
-				}
-			}
-			if (this.panels.size > 0) this.activateStoreForActiveFile();
+			if (this.panelLeaves().length > 0) this.activateStoreForActiveFile();
 		});
 
 		console.log("[usage-norms] loaded");
@@ -188,9 +178,14 @@ export default class UsageNormsPlugin extends Plugin {
 		for (const leaf of leaves) leaf.detach();
 	}
 
-	async onPanelOpened(view: UsageNormsView): Promise<void> {
-		this.panels.add(view);
-		this.log(`panel-open panels=${this.panels.size}`);
+	/**
+	 * 面板视图被创建（或者被 Obsidian 重建）。
+	 *
+	 * 和 todo-panel 一样：这里只负责重新挂上当前笔记 + 重画，不往任何 Set 里
+	 * 记东西；「活着的视图」永远靠 `getLeavesOfType` 现查。
+	 */
+	async onPanelOpened(): Promise<void> {
+		this.log(`panel-open leaves=${this.panelLeaves().length}`);
 		try {
 			await this.library.refresh();
 		} catch (error) {
@@ -198,24 +193,41 @@ export default class UsageNormsPlugin extends Plugin {
 			this.log(`templates refresh failed: ${(error as Error).message}`);
 		}
 		this.activateStoreForActiveFile();
-		view.render();
+		this.refreshViews();
 	}
 
-	onPanelClosed(view: UsageNormsView): void {
-		this.panels.delete(view);
-		this.views.delete(view);
-		this.log(`panel-close panels=${this.panels.size} leaves=${this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length}`);
-		if (this.panels.size > 0) return;
-		// 先别急着挂起：iPad 键盘弹起时 Obsidian 会收起 / 重建侧栏，
-		// 视图可能马上又被创建回来。800ms 后确认真的没有叶子了再停。
+	/**
+	 * 视图被关闭：**什么都不做**。
+	 *
+	 * todo-panel 的 onClose 就是空的（它能一直显示，就是因为关闭时不清任何
+	 * 状态，重画永远从 getLeavesOfType 现拿视图）。这里之前在这里清空 / 挂起，
+	 * 键盘一弹侧栏一重建，行就没了。
+	 */
+	onPanelClosed(): void {
+		this.log(`panel-close leaves=${this.panelLeaves().length}`);
+		// 建议留着（下一次打开原样恢复），但正文标记要跟着消失；
+		// 延迟一点再判断，避开 Obsidian 重建视图时的瞬时「没有叶子」。
 		window.setTimeout(() => {
-			if (this.panels.size > 0) return;
-			if (this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length > 0) return;
-			this.log("panel-gone -> suspend");
-			this.store.suspend();
+			if (this.panelOpen) {
+				this.scheduleRepaint();
+				return;
+			}
 			clearMarks(this.markedView);
 			this.markedView = null;
-		}, 800);
+		}, 120);
+	}
+
+	/** 正在显示的面板视图（每次现查，不缓存实例）。 */
+	private panelLeaves(): WorkspaceLeaf[] {
+		return this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS);
+	}
+
+	private panelViews(): UsageNormsView[] {
+		const views: UsageNormsView[] = [];
+		for (const leaf of this.panelLeaves()) {
+			if (leaf.view instanceof UsageNormsView) views.push(leaf.view);
+		}
+		return views;
 	}
 
 	private activateStoreForActiveFile(): void {
@@ -239,8 +251,7 @@ export default class UsageNormsPlugin extends Plugin {
 	 * 会触发侧栏收起 / 视图重建，记账会瞬间变成 0，但面板其实还在。
 	 */
 	private get panelOpen(): boolean {
-		if (this.panels.size > 0) return true;
-		return this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length > 0;
+		return this.panelLeaves().length > 0;
 	}
 
 	// ------------------------------------------------------------------ 编辑
@@ -293,9 +304,20 @@ export default class UsageNormsPlugin extends Plugin {
 	}
 
 	private activeCm(): EditorView | null {
-		const cm = (this.currentMarkdownView()?.editor as unknown as { cm?: EditorView } | undefined)?.cm;
-		if (!cm || !cm.dom || cm.dom.isConnected === false) return null;
-		return cm;
+		const view = this.currentMarkdownView();
+		if (!view) return null;
+		// 桌面端一直有 editor.cm（未写进公开类型）；移动端不一定有。
+		const direct = (view.editor as unknown as { cm?: EditorView }).cm;
+		if (direct && direct.dom && direct.dom.isConnected !== false) return direct;
+		// 移动端：直接从 DOM 找 CM6 实例，别依赖 editor.cm。
+		const dom = view.containerEl.querySelector(".cm-editor") as HTMLElement | null;
+		if (!dom) return null;
+		try {
+			return EditorView.findFromDOM(dom) ?? null;
+		} catch (error) {
+			this.log(`activeCm findFromDOM failed: ${(error as Error).message}`);
+			return null;
+		}
 	}
 
 	private onEditorChange(editor: Editor, info: MarkdownView | MarkdownFileInfo): void {
@@ -329,8 +351,8 @@ export default class UsageNormsPlugin extends Plugin {
 		if (!this.panelOpen) return;
 		this.log(
 			`layout-change viewport=${window.innerWidth}x${window.innerHeight} leaves=${
-				this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS).length
-			} panels=${this.panels.size} active=${this.store.active}`
+				this.panelLeaves().length
+			} active=${this.store.active}`
 		);
 		this.refreshViews();
 		this.activateStoreForActiveFile();
@@ -574,7 +596,8 @@ export default class UsageNormsPlugin extends Plugin {
 	}
 
 	private refreshViews(): void {
-		for (const view of this.views) {
+		// 每次现查活着的视图（todo-panel 的做法），不缓存实例。
+		for (const view of this.panelViews()) {
 			try {
 				view.render();
 				this.logViewMetrics(view);
@@ -616,10 +639,20 @@ export default class UsageNormsPlugin extends Plugin {
 			clearMarks(this.markedView);
 			this.markedView = null;
 		}
-		if (!cm) return;
+		if (!cm) {
+			if (this.store.items.length > 0) this.log("repaint: no editor view (无法画正文标记)");
+			return;
+		}
 		this.markedView = cm;
 		const suggestions = this.store.items.map((item) => item.suggestion);
-		applyMarks(cm, this.store.textSnapshot, suggestions, this.store.activeIndex);
+		const marks = applyMarks(cm, this.store.textSnapshot, suggestions, this.store.activeIndex);
+		if (suggestions.length > 0) {
+			const line = `repaint marks=${marks}/${suggestions.length}`;
+			if (line !== this.lastRepaintLog) {
+				this.lastRepaintLog = line;
+				this.log(line);
+			}
+		}
 	}
 
 	/** 记账落盘：合并写、顺手裁掉太老的页面。 */

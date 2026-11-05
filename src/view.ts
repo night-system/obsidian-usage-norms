@@ -41,11 +41,11 @@ export class UsageNormsView extends ItemView {
 
 	async onOpen(): Promise<void> {
 		this.build();
-		await this.plugin.onPanelOpened(this);
+		await this.plugin.onPanelOpened();
 	}
 
 	async onClose(): Promise<void> {
-		this.plugin.onPanelClosed(this);
+		this.plugin.onPanelClosed();
 	}
 
 	private build(): void {

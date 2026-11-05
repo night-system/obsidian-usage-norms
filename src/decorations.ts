@@ -49,14 +49,14 @@ function isAlive(view: EditorView | null): view is EditorView {
 	return !!view && !!view.dom && view.dom.isConnected !== false;
 }
 
-/** 把当前建议画到正文上；对不上原文的自动跳过。 */
+/** 把当前建议画到正文上；对不上原文的自动跳过。返回真正画上去的条数。 */
 export function applyMarks(
 	view: EditorView | null,
 	text: string,
 	suggestions: Suggestion[],
 	activeIndex: number | null
-): void {
-	if (!isAlive(view)) return;
+): number {
+	if (!isAlive(view)) return -1;
 	const doc = view.state.doc;
 	const ranges: Range<Decoration>[] = [];
 	for (let i = 0; i < suggestions.length; i += 1) {
@@ -76,8 +76,10 @@ export function applyMarks(
 	ranges.sort((a, b) => a.from - b.from);
 	try {
 		view.dispatch({ effects: setMarks.of(Decoration.set(ranges, true)) });
+		return ranges.length;
 	} catch (error) {
 		console.error("[usage-norms] apply marks", error);
+		return -1;
 	}
 }
 

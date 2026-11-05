@@ -102,25 +102,34 @@
 	text-overflow: ellipsis;
 }
 
-/* ============================================================ 正文标记 */
+/* ============================================================ 正文标记
+ *
+ * 只用长写法 + !important：有些主题会把 span 上的 text-decoration 清掉，
+ * 短写法（text-decoration: underline dashed）会被整条覆盖，底部的虚线就没了。
+ */
 
 .cm-s-obsidian .cm-usage-norms-del,
-.markdown-source-view .cm-usage-norms-del {
-	text-decoration: line-through;
-	text-decoration-color: var(--text-faint);
+.markdown-source-view .cm-usage-norms-del,
+.cm-editor .cm-usage-norms-del {
+	text-decoration-line: line-through !important;
+	text-decoration-style: solid !important;
+	text-decoration-color: var(--text-faint) !important;
 	color: var(--text-muted);
 }
 
 .cm-s-obsidian .cm-usage-norms-ins,
-.markdown-source-view .cm-usage-norms-ins {
-	text-decoration: underline dashed;
-	text-decoration-color: var(--interactive-accent);
-	text-decoration-thickness: 1.5px;
+.markdown-source-view .cm-usage-norms-ins,
+.cm-editor .cm-usage-norms-ins {
+	text-decoration-line: underline !important;
+	text-decoration-style: dashed !important;
+	text-decoration-color: var(--interactive-accent) !important;
+	text-decoration-thickness: 1.5px !important;
 	text-underline-offset: 3px;
 }
 
 .cm-s-obsidian .cm-usage-norms-active,
-.markdown-source-view .cm-usage-norms-active {
+.markdown-source-view .cm-usage-norms-active,
+.cm-editor .cm-usage-norms-active {
 	background: var(--text-selection);
 	border-radius: 2px;
 }
