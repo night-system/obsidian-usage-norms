@@ -1,6 +1,6 @@
 {
   "name": "obsidian-usage-norms",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Obsidian usage-norms plugin: left sidebar writing suggestions driven by your own prompt templates",
   "main": "main.js",
   "scripts": {

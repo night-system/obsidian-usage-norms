@@ -117,11 +117,27 @@ export class AssistStore {
 	 */
 	activate(fileKey: string, text: string, caret: number): void {
 		if (fileKey.length > 0 && this.fileKey === fileKey) {
+			// 同页同文：只更新光标，不重画、不重算。iPad 键盘弹起会连着触发
+			// active-leaf-change / layout-change，这些事件不是「数据变了」，
+			// 不该把面板再画一遍（todo panel 也不会）。
+			if (text === this.text) {
+				this.active = true;
+				this.caret = caret;
+				return;
+			}
+			// iPad 重建视图 / 焦点在侧栏时，编辑器可能瞬间返回空串。用户真的
+			// 把全文删空会走 onText，那里的空文本才是真事；这里不能拿空串去
+			// rebase —— 一 rebase 建议就全被当成「对不上原文」清掉了。
+			if (text.length === 0 && this.text.length > 0) {
+				this.active = true;
+				this.host.log?.("activate skip empty text");
+				return;
+			}
 			const old = this.text;
 			this.active = true;
 			this.text = text;
 			this.caret = caret;
-			if (old !== text) this.rebase(old, text);
+			this.rebase(old, text);
 			this.host.notify();
 			return;
 		}

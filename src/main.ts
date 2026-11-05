@@ -33,9 +33,6 @@ export default class UsageNormsPlugin extends Plugin {
 	private markedView: EditorView | null = null;
 	private repaintTimer: number | null = null;
 	private saveTimer: number | null = null;
-	/** 面板开着时的自愈巡检（iPad 键盘弹起 / 侧栏重排后把行画回活容器）。 */
-	private healTimer: number | null = null;
-	private lastHealLog = "";
 	/** 正文画不画虚线 / 删除线只看这一条：面板看不看得见（见 visibility.ts）。 */
 	private lastPanelVisible = false;
 	/** 可见性巡检：收起侧栏 / 切到别的标签不一定有事件，隔一会儿对一次。 */
@@ -48,6 +45,9 @@ export default class UsageNormsPlugin extends Plugin {
 	 * null —— 但这时 ✓ 仍然必须改到那篇笔记，所以记一份最近的 MarkdownView。
 	 */
 	private lastMarkdown: MarkdownView | null = null;
+
+	/** 上一次真正画出来的行内容；没变就不重画（输入 / loading 不碰面板）。 */
+	private lastRowsSignature = "";
 
 	/** 调试日志（只留最近 400 条），命令「导出调试日志」把它写成笔记。 */
 	private logBuffer: string[] = [];
@@ -162,9 +162,11 @@ export default class UsageNormsPlugin extends Plugin {
 			})
 		);
 
-		// 插件加载时如果面板本来就开着（工作区恢复），补一次激活。
+		// 插件加载时如果面板本来就开着（工作区恢复），补一次激活 + 重画。
 		this.app.workspace.onLayoutReady(() => {
-			if (this.panelLeaves().length > 0) this.activateStoreForActiveFile();
+			if (this.panelLeaves().length === 0) return;
+			this.activateStoreForActiveFile();
+			this.refreshViews(true);
 		});
 
 		console.log("[usage-norms] loaded");
@@ -173,7 +175,6 @@ export default class UsageNormsPlugin extends Plugin {
 	onunload(): void {
 		if (this.repaintTimer !== null) window.clearTimeout(this.repaintTimer);
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
-		this.stopHealthWatch();
 		this.stopVisibilityWatch();
 		void this.saveNow();
 		clearMarks(this.markedView);
@@ -197,60 +198,19 @@ export default class UsageNormsPlugin extends Plugin {
 		}
 		this.app.workspace.leftSplit.expand();
 		this.app.workspace.revealLeaf(leaf);
-		this.startHealthWatch();
-		this.refreshViews();
+		// 打开面板是**显式动作**：这时候把当前笔记挂上、顺手重画一次。
+		// 之后就跟 todo panel 一样，只在数据变化 / 视图重建时画，不再因为
+		// 布局、键盘、尺寸变化去碰这个视图。
+		this.activateStoreForActiveFile();
+		this.refreshViews(true);
 		// 面板一露头就把正文标记补上（不必等下一次巡检）。
 		this.syncPanelVisibility();
+		this.scheduleRepaint();
 	}
 
 	closePanel(): void {
 		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_USAGE_NORMS);
 		for (const leaf of leaves) leaf.detach();
-	}
-
-	/**
-	 * 面板视图被创建（或者被 Obsidian 重建）。
-	 *
-	 * 和 todo-panel 一样：这里只负责重新挂上当前笔记 + 重画，不往任何 Set 里
-	 * 记东西；「活着的视图」永远靠 `getLeavesOfType` 现查。
-	 */
-	async onPanelOpened(): Promise<void> {
-		this.log(`panel-open leaves=${this.panelLeaves().length}`);
-		this.startHealthWatch();
-		// 先挂当前笔记、把内存里的建议画上去 —— 这一步不能等模板刷新：
-		// iPad 键盘弹起会重建侧栏视图，库还没就绪时 await 会把面板空着。
-		this.activateStoreForActiveFile();
-		this.refreshViews();
-		try {
-			await this.library.refresh();
-		} catch (error) {
-			// 读模板失败不能把整个面板挂起（iPad 上库可能还没就绪）。
-			this.log(`templates refresh failed: ${(error as Error).message}`);
-			return;
-		}
-		this.refreshViews();
-	}
-
-	/**
-	 * 视图被关闭：**什么都不做**。
-	 *
-	 * todo-panel 的 onClose 就是空的（它能一直显示，就是因为关闭时不清任何
-	 * 状态，重画永远从 getLeavesOfType 现拿视图）。这里之前在这里清空 / 挂起，
-	 * 键盘一弹侧栏一重建，行就没了。
-	 */
-	onPanelClosed(): void {
-		this.log(`panel-close leaves=${this.panelLeaves().length}`);
-		// 建议留着（下一次打开原样恢复），但正文标记要跟着消失；
-		// 延迟一点再判断，避开 Obsidian 重建视图时的瞬时「没有叶子」。
-		window.setTimeout(() => {
-			if (this.panelOpen) {
-				this.scheduleRepaint();
-				return;
-			}
-			this.stopHealthWatch();
-			clearMarks(this.markedView);
-			this.markedView = null;
-		}, 120);
 	}
 
 	/** 正在显示的面板视图（每次现查，不缓存实例）。 */
@@ -266,59 +226,17 @@ export default class UsageNormsPlugin extends Plugin {
 		return views;
 	}
 
-	/** 视图尺寸变了（iPad 键盘弹起 / 侧栏开合）：补画正文标记，巡检拉起来。 */
-	onPanelResized(): void {
-		this.startHealthWatch();
-		this.scheduleRepaint();
-	}
-
 	/**
-	 * 自愈巡检：面板开着时每 400ms 看一眼「活容器里的行数」是否等于建议条数。
+	 * 视口变了（键盘弹出 / 收起）：**只补正文标记，不重画面板**。
 	 *
-	 * iPad 键盘弹起时 Obsidian 会重排侧栏：视图实例还在、`onOpen` / `onResize`
-	 * 却不一定来，DOM 却可能已经被换掉 —— 只靠事件会漏。行数对不上就按当前
-	 * store 重画一遍，最多 400ms 补回来；对得上时什么都不做，不会闪。
+	 * todo panel 在键盘弹起时什么都不做，它的行照样在；这个面板之前就是
+	 * 在 resize / layout-change 里抢着重画，才把行画丢的。视图的重画只留给
+	 * `onOpen`（Obsidian 真的重建视图时）和 store 的数据变化。
 	 */
-	private startHealthWatch(): void {
-		if (this.healTimer !== null) return;
-		if (!this.panelOpen) return;
-		this.healTimer = window.setInterval(() => this.healthCheck(), 400);
-	}
-
-	private stopHealthWatch(): void {
-		if (this.healTimer === null) return;
-		window.clearInterval(this.healTimer);
-		this.healTimer = null;
-	}
-
-	private healthCheck(): void {
-		if (!this.panelOpen) {
-			this.stopHealthWatch();
-			return;
-		}
-		const want = this.store.items.length;
-		for (const view of this.panelViews()) {
-			const rows = view.rowCount;
-			if (rows === want) continue;
-			const line = `heal rows=${rows} want=${want} live=${view.live}`;
-			if (line !== this.lastHealLog) {
-				this.lastHealLog = line;
-				this.log(line);
-			}
-			try {
-				view.render();
-			} catch (error) {
-				this.log(`heal failed: ${(error as Error).message}`);
-			}
-		}
-	}
-
-	/** 视口变了（键盘弹出 / 收起）：重画面板 + 正文标记，并开着巡检。 */
 	private onViewportChanged(source: string): void {
 		this.log(`${source} ${window.innerWidth}x${window.innerHeight}`);
 		if (!this.panelOpen) return;
-		this.startHealthWatch();
-		this.refreshViews();
+		this.syncPanelVisibility();
 		this.scheduleRepaint();
 	}
 
@@ -526,7 +444,17 @@ export default class UsageNormsPlugin extends Plugin {
 		this.activateStoreForActiveFile();
 	}
 
-	/** 布局变了（键盘、窗口尺寸、侧栏收起/重建）：把面板和标记重新贴上去。 */
+	/**
+	 * 布局变了（键盘、窗口尺寸、侧栏收起/重建）：**只补正文标记，不重画面板**。
+	 *
+	 * 这是 0.1.8 和之前几版最关键的区别。todo panel 没有 layout-change /
+	 * resize 监听，键盘弹起时它一行都不重画，行照样在；这个面板之前每次布局
+	 * 变化都急着重画（0.1.6 还加了 150ms / 600ms 的补画），结果正好在
+	 * Obsidian 重排侧栏、容器还没稳定的时候把行画进了过渡节点里。
+	 *
+	 * 现在视图的重画只有两个入口：`onOpen()`（Obsidian 真的重建视图）和
+	 * store 数据变化（`onStoreChanged` → `refreshViews`）。这里只处理正文标记。
+	 */
 	private onLayoutChange(): void {
 		if (!this.panelOpen) return;
 		this.log(
@@ -534,16 +462,8 @@ export default class UsageNormsPlugin extends Plugin {
 				this.panelLeaves().length
 			} active=${this.store.active}`
 		);
-		this.startHealthWatch();
-		this.refreshViews();
-		this.activateStoreForActiveFile();
+		this.syncPanelVisibility();
 		this.scheduleRepaint();
-		// 侧栏重排 / 键盘动画结束后再补两次：有时事件先到、容器后换。
-		for (const delay of [150, 600]) {
-			window.setTimeout(() => {
-				if (this.panelOpen) this.refreshViews();
-			}, delay);
-		}
 	}
 
 	/** CM6 只用来补光标位置（正文变化由 editor-change 管）。 */
@@ -782,7 +702,21 @@ export default class UsageNormsPlugin extends Plugin {
 		this.scheduleRepaint();
 	}
 
-	private refreshViews(): void {
+	/**
+	 * 重画面板 —— **只有行内容真的变了才画**。
+	 *
+	 * 这是从 todo panel 学来的更新方式：todo 只在元数据变化 / 删除文件时
+	 * refresh，用户每敲一个字不会重画。这个插件之前每敲一个字都走
+	 * `onStoreChanged → refreshViews → view.render()`，键盘弹起、侧栏正在
+	 * 重排的那几百毫秒里也在画 —— 正好是观测到「左栏空掉」的时间窗。
+	 *
+	 * 现在用行签名（建议内容 + 高亮项 + 是否显示 reason）挡住无变化的通知：
+	 * 打字、loading、请求失败都不会碰面板；新建议到达 / ✓ / × / 选中才画。
+	 */
+	private refreshViews(force = false): void {
+		const signature = this.rowsSignature();
+		if (!force && signature === this.lastRowsSignature) return;
+		this.lastRowsSignature = signature;
 		// 每次现查活着的视图（todo-panel 的做法），不缓存实例。
 		for (const view of this.panelViews()) {
 			try {
@@ -793,6 +727,12 @@ export default class UsageNormsPlugin extends Plugin {
 				console.error("[usage-norms] render", error);
 			}
 		}
+	}
+
+	private rowsSignature(): string {
+		return `${this.data.showReason ? 1 : 0}|${this.store.activeIndex}|${JSON.stringify(
+			this.store.items.map((item) => item.suggestion)
+		)}`;
 	}
 
 	/** 排查用：画了几行、容器多高（侧栏被收起时高度会是 0）。 */

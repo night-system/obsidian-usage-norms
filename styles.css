@@ -7,23 +7,25 @@
  * 大药丸（实测），尺寸和颜色在这里锁死。
  */
 
+/* 容器：照 todo-panel 的 `.todo-panel-container` 写 —— 视图内容元素自己
+ * `height: 100%` + 自己滚，**没有中间的 body 层**。
+ *
+ * 之前是 `.usage-norms`（flex 竖向）+ `.usage-norms-body`（flex: 1）两层；
+ * iPad 键盘弹起、侧栏被重排时，中间那层 flex 子项可能算成 0 高，行还在 DOM
+ * 里却一个像素都不显示。todo panel 只有一层，height 直接跟父容器走。
+ */
 .usage-norms {
-	display: flex;
-	flex-direction: column;
 	height: 100%;
 	min-height: 0;
 	padding: 0;
-	overflow: hidden;
-}
-
-/* min-height: 0 是 flex 子项能滚动的必要条件：iPad 键盘弹起把侧栏压矮时，
-   少了它高度会顶着内容走，行看着像被裁掉了。 */
-.usage-norms-body {
-	flex: 1 1 auto;
-	min-height: 0;
 	overflow-y: auto;
 	overflow-x: hidden;
-	padding: 0;
+}
+
+/* 和 todo panel 的 `.todo-panel-list` 一样：容器里先放一个列表，行再往里放。 */
+.usage-norms-list {
+	display: flex;
+	flex-direction: column;
 }
 
 .usage-norms-row {

@@ -91,7 +91,7 @@
 ```powershell
 npm install
 npm run build      # tsc 类型检查 + esbuild 打包出 main.js
-npm test           # 56 条纯逻辑自测（切句 / 契约闸门 / 状态机 / 类名对齐 / 面板可见性），不联网
+npm test           # 58 条纯逻辑自测（切句 / 契约闸门 / 状态机 / 类名对齐 / view 对齐 todo-panel / 面板可见性），不联网
 ```
 
 ## 目录
@@ -99,7 +99,7 @@ npm test           # 56 条纯逻辑自测（切句 / 契约闸门 / 状态机 /
 ```
 src/
   main.ts         插件入口：面板 / 编辑器事件 / 光标 / 设置联动 / 落盘
-  view.ts         左侧边栏的视图（ItemView）
+  view.ts         左侧边栏的视图（ItemView，整块照 obsidian-todo-panel 的 view）
   settings.ts     设置页（模板文件夹 / 模板列表 / 强度 / reason / 密钥 / 记录）
   templates.ts    把「某个文件夹里的文件」读成模板
   store.ts        状态机：按句增量、预览、记账、作废在飞请求
@@ -116,21 +116,32 @@ examples/         三份能直接用的模板
 `用语规范调试.md`（只有事件名、文本长度、建议条数，**没有正文**）。真机上
 复现问题后跑一次这个命令，把那个文件发过来就能定位。
 
-iPad 上键盘弹起会让 Obsidian 收起 / 重排侧栏，**视图实例还在、DOM 却可能被换掉**。
-0.1.5 之前踩的坑是「缓存了 body 节点」：行画进了已经脱离文档的孤儿节点，屏幕上
-就是空的 —— 看起来就是「键盘一抬，左边就没了」。0.1.6 照 `obsidian-todo-panel`
-的写法把这条彻底改掉（它的行不会因为侧栏重建而消失）：
+iPad 上键盘弹起会让 Obsidian 收起 / 重排侧栏，面板会短暂经历「布局变化」。
+0.1.5–0.1.7 一直在猜这个差异：缓存 body、现查容器、`onResize`、400ms 自愈巡检，
+每版都修掉一个真实差异，但真机上照样会空。**0.1.8 改成整块移植**：既然用户的
+todo panel 在 iPad 上键盘弹起时行不会消失，就把它的 view 整个搬过来，不再挑机制抄。
 
-- **不缓存任何 DOM**：每次 render 现查 `containerEl.children[1]`，body 没了就重建；
-- **`onResize()` 直接重画**：Obsidian 官方的「视图尺寸变了」回调，比 window.resize 更早；
-- **不缓存视图实例**：每次重画都 `getLeavesOfType` 现查活着的视图；
-- **`onClose` 什么都不做**：不清建议、不挂起，只在真的没有叶子时停正文标记；
-- 「面板在不在」= 工作区里还有没有这个叶子，不看 onOpen/onClose 记账；
-- **400ms 自愈巡检**：面板开着时对一下「活容器里的行数 = 建议条数」，对不上就重画；
+现在的写法（逐行照 `obsidian-todo-panel` 的 `TodoPanelView`）：
+
+- 容器只取 `this.containerEl.children[1]`，不缓存、不兜底；
+- `render()` 就是 `scrollTop = container.scrollTop` → `container.empty()` →
+  `container.addClass(...)` → 把行直接画进去 → `container.scrollTop = scrollTop`；
+- `onOpen()` 画一遍，`onClose()` **什么都不做**（不清建议、不挂起、不重画）；
+- **没有 `onResize`、没有自愈巡检**，`layout-change` / `window.resize` /
+  `visualViewport` 只补正文标记，**不重画面板**；
+- 面板的重画只剩三个入口：`onOpen()`（Obsidian 真的重建视图）、打开面板、以及
+  **行内容真的变了**的 store 通知；打字 / loading 不碰面板；
 - 编辑事件照常送检；建议本来就不是持久化数据，所以靠内存里的 store 保留。
 
-日志里会打 `view rebuild body` 和 `heal rows=a want=b`：真机再出现空栏时，
-把日志导出来就能看出是容器被换掉、还是别的原因。
+本机验证脚本 `_test/keyboard.mjs`（隔离库 + CDP）会把侧栏收起再展开、把视口从
+800 压到 520 再恢复、切到文件列表再切回、`detachLeavesOfType` 后重新打开；
+每一步都量「行数 / 第一行像素高度 / render 调用次数」。0.1.8 的结果是：布局变化
+期间 render 次数**保持 0**，行和像素高度都在；只有 detach 重建那一步会由
+`onOpen` 重画一次。0.1.6 的 `_test/heal.mjs`（人为换掉内容容器）已经不符合
+0.1.8 的写法 —— 那本来也不是真机上发生的事，脚本保留仅作历史记录。
+
+日志里会打 `layout-change ... leaves=1` 和 `repaint marks=n/m`：真机再出现空栏时，
+导出日志就能看出是视图被重建、还是数据被清空。
 
 正文标记（删除线 / 底部虚线）另外做了两层兜底：CM6 视图先用 `editor.cm`，移动端
 没有就从 DOM（`EditorView.findFromDOM`）找；CSS 用 `text-decoration-line/style`
@@ -153,6 +164,22 @@ iPad 上键盘弹起会让 Obsidian 收起 / 重排侧栏，**视图实例还在
 
 ## 更新记录
 
+- **0.1.8**
+  - **把 `obsidian-todo-panel` 的 view 整块搬过来**，不再逐条对齐机制。容器只取
+    `containerEl.children[1]`，`render()` 按 todo panel 的顺序 `empty` → 加类名 →
+    画行 → 恢复 `scrollTop`；`onClose` 什么都不做；删掉 `onResize` 和 400ms 自愈巡检。
+  - `layout-change` / `window.resize` / `visualViewport` **不再重画面板**，只补正文
+    标记；面板只在 `onOpen`（视图真被重建）、打开面板、行内容变化时重画。
+  - `refreshViews()` 先比「行签名」（建议内容 + 高亮项 + 是否显示 reason）：打字、
+    loading、请求失败这类通知不再每一下都重画面板 —— 之前每敲一个字都重建一次
+    列表，正好撞上键盘弹起、侧栏重排的时间窗。
+  - store 的 `activate()` 对「同页同文」只更新光标、不重画；iPad 重建视图时编辑器
+    可能瞬间返回空串，这种情况直接跳过，不拿空串去清空建议。
+  - 新增 `_test/keyboard.mjs`：收起/展开侧栏、视口压到 520、切标签、detach 重建，
+    逐步量行数 / 行高 / render 次数；`npm test` 的面板自测改成盯「和 todo-panel
+    的写法一致」，58 条全过。
+  - 0.1.7 的「面板看不见就不画标记」原样保留。
+
 - **0.1.7**
   - **面板看不见就不画正文标记**：左侧栏收起、或者侧栏停在别的标签（文件列表 /
     搜索 / 大纲 …）时，正文里不再出现语法修正的虚线 / 删除线 —— 建议本身看不见，
@@ -165,10 +192,10 @@ iPad 上键盘弹起会让 Obsidian 收起 / 重排侧栏，**视图实例还在
     以及 `_test/visibility.mjs`：真机 CDP 跑「可见 → 收起 → 展开 → 切标签 → 切回」
     五个状态。
 
-- **0.1.6**
-  - 修好 iPad 键盘弹起后左栏空掉：根因是视图缓存了 body 节点，Obsidian 重排
-    侧栏、换掉内容容器之后，行都画进了脱离文档的孤儿节点。现在每次渲染现查活
-    容器并重建，加 `onResize` 重画和 400ms 自愈巡检（行数对不上就补画）。
+- **0.1.6**（0.1.8 已证明这一版还不够：真机上仍然会空，最终改成整块移植 todo-panel）
+  - 修 iPad 键盘弹起后左栏空掉：当时判断根因是视图缓存了 body 节点、Obsidian 重排
+    侧栏后行画进了孤儿节点。于是每次渲染现查活容器并重建，加 `onResize` 重画和
+    400ms 自愈巡检（行数对不上就补画）。这些机制在 0.1.8 里全部删掉了。
   - 侧栏被键盘压矮时列表仍能滚动（补 `min-height: 0`）。
   - 新增 `_test/heal.mjs`：模拟「容器被换掉 / 被清空」，验证面板能自己恢复。
 

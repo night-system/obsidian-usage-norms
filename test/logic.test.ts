@@ -528,33 +528,63 @@ async function styleSuite(): Promise<void> {
 	});
 }
 
-// --------------------------------------------------- 5. 侧栏面板不缓存 DOM
+// ------------------------------------- 5. 侧栏面板：整个搬 todo-panel 的 view
 
 /**
- * 0.1.5 的「iPad 键盘一抬，左栏就空」：视图把 body 节点缓存成了 `this.bodyEl`，
- * Obsidian 重排侧栏、换掉内容容器之后，行全画进已脱离文档的孤儿节点。这条
- * 用例盯住「不缓存 + 每次现查 + 有 onResize / 自愈巡检」，防止再退回去。
+ * 用户的事实：todo panel 的行不会因为 iPad 键盘弹起而消失，这个面板会。
+ * 0.1.5–0.1.7 都在「猜差异、对齐某个机制」（缓存 body、现查容器、onResize、
+ * 自愈巡检），真机上照样空。0.1.8 起改成整块移植：view 的容器获取、render、
+ * onOpen/onClose 全部照 `obsidian-todo-panel` 的 `TodoPanelView` 写。
+ *
+ * 这几条是防退化的静态检查：以后谁再把 onResize / 自愈巡检 / 布局变化重画
+ * 加回来，先红一次。
  */
 async function panelDomSuite(): Promise<void> {
-	console.log("\n# 侧栏面板不缓存 DOM");
+	console.log("\n# 侧栏面板：整块照 todo-panel 的 view");
 	const root = path.join(__dirname, "..", "..");
 	const view = fs.readFileSync(path.join(root, "src", "view.ts"), "utf8");
 	const main = fs.readFileSync(path.join(root, "src", "main.ts"), "utf8");
 
-	await test("view.ts 不缓存 body 节点（没有 this.bodyEl）", () => {
+	await test("view.ts 直接取 containerEl.children[1]（todo-panel 的写法）", () => {
+		assert.ok(
+			/this\.containerEl\.children\[1\]/.test(view),
+			"没有直接取 this.containerEl.children[1]"
+		);
+		assert.ok(!/liveRoot/.test(view), "view.ts 里又出现了 liveRoot 之类的容器兜底");
 		assert.ok(!/this\.bodyEl/.test(view), "view.ts 里又出现了缓存的 this.bodyEl");
 	});
 
-	await test("view.ts 每次 render 现查 containerEl.children", () => {
-		assert.ok(view.includes("containerEl.children"), "应该现查 containerEl.children[1]，别缓存容器");
+	await test("view.ts 的 render = empty + addClass + 重画 + 恢复 scrollTop", () => {
+		assert.ok(/container\.empty\(\)/.test(view), "render 没有先 container.empty()");
+		assert.ok(/container\.addClass\("usage-norms"\)/.test(view), "render 没给容器加类名");
+		assert.ok(/container\.scrollTop = scrollTop/.test(view), "render 没有恢复滚动位置");
 	});
 
-	await test("view.ts 实现了 onResize（Obsidian 改视图尺寸时重画）", () => {
-		assert.ok(/onResize\s*\(\s*\)\s*:/.test(view), "缺少 onResize()");
+	await test("view.ts 不再实现 onResize（todo-panel 没有这个回调）", () => {
+		assert.ok(!/onResize\s*\(/.test(view), "view.ts 里又出现了 onResize()");
 	});
 
-	await test("main.ts 有面板自愈巡检（healthCheck + setInterval）", () => {
-		assert.ok(main.includes("healthCheck") && main.includes("setInterval"), "缺少自愈巡检");
+	await test("view.ts 的 onClose 什么都不做（不清建议、不挂起）", () => {
+		const at = view.indexOf("async onClose");
+		assert.ok(at >= 0, "找不到 onClose");
+		const body = view.slice(at, at + 120);
+		assert.ok(!/plugin\./.test(body), "onClose 里又在调插件、清状态了");
+	});
+
+	await test("main.ts 没有自愈巡检，layout-change 也不重画面板", () => {
+		assert.ok(!main.includes("healthCheck"), "main.ts 里又出现了自愈巡检");
+		const at = main.indexOf("private onLayoutChange");
+		assert.ok(at >= 0, "找不到 onLayoutChange");
+		const body = main.slice(at, at + 1200);
+		assert.ok(!body.includes("refreshViews"), "layout-change 又去重画面板了");
+	});
+
+	await test("refreshViews 只在行内容变化时重画（打字不碰面板）", () => {
+		assert.ok(main.includes("rowsSignature"), "没有行签名，打字会每一下都重画面板");
+		assert.ok(
+			/signature === this\.lastRowsSignature/.test(main),
+			"refreshViews 没比签名，无变化的通知也会重画"
+		);
 	});
 }
 
